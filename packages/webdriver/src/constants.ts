@@ -1,0 +1,201 @@
+import type { Options } from '@wdio/types'
+
+import type { RemoteConfig } from './types.js'
+
+/**
+ * Defined here, not in `bidi/core.ts`: `bidi/core.ts` imports this file through
+ * `bidi/utils.ts`, so a value imported from there was still undefined when
+ * `DEFAULTS` was created.
+ */
+export const DEFAULT_RESPONSE_TIMEOUT = 1000 * 180
+export const DEFAULT_CONNECT_TIMEOUT = 1000 * 10
+
+/**
+ * The `name` of the error of a command that can get no result because its session or
+ * its WebDriver BiDi connection ended, see `isSessionEndedError`.
+ */
+export const SESSION_ENDED_ERROR = 'session ended'
+
+export const DEFAULTS: Options.Definition<Required<RemoteConfig>> = {
+    /**
+     * protocol of automation driver
+     */
+    protocol: {
+        type: 'string',
+        default: 'http',
+        match: /(http|https)/
+    },
+    /**
+     * hostname of automation driver
+     */
+    hostname: {
+        type: 'string',
+        default: 'localhost'
+    },
+    /**
+     * port of automation driver
+     */
+    port: {
+        type: 'number'
+    },
+    /**
+     * path to WebDriver endpoints
+     */
+    path: {
+        type: 'string',
+        validate: (path: string): boolean => {
+            if (!path.startsWith('/')) {
+                throw new TypeError('The option "path" needs to start with a "/"')
+            }
+
+            return true
+        },
+        default: '/'
+    },
+    /**
+     * A key-value store of query parameters to be added to every selenium request
+     */
+    queryParams: {
+        type: 'object'
+    },
+    /**
+     * cloud user if applicable
+     */
+    user: {
+        type: 'string'
+    },
+    /**
+     * access key to user
+     */
+    key: {
+        type: 'string'
+    },
+    /**
+     * capability of WebDriver session
+     */
+    capabilities: {
+        type: 'object',
+        required: true
+    },
+    /**
+     * Level of logging verbosity
+     */
+    logLevel: {
+        type: 'string',
+        default: 'info',
+        match: /(trace|debug|info|warn|error|silent)/
+    },
+    /**
+     * directory for log files
+     */
+    outputDir: {
+        type: 'string'
+    },
+    /**
+     * Timeout for any WebDriver request to a driver or grid
+     */
+    connectionRetryTimeout: {
+        type: 'number',
+        default: 120000
+    },
+    /**
+     * Count of request retries to the Selenium server
+     */
+    connectionRetryCount: {
+        type: 'number',
+        default: 3
+    },
+    /**
+     * Timeout for a WebDriver Bidi command to receive a response from the browser
+     */
+    bidiResponseTimeout: {
+        type: 'number',
+        default: DEFAULT_RESPONSE_TIMEOUT,
+        validate: (timeout: number): boolean => {
+            if (!Number.isFinite(timeout) || timeout <= 0) {
+                throw new TypeError('The option "bidiResponseTimeout" needs to be a positive number')
+            }
+
+            return true
+        }
+    },
+    /**
+     * Timeout for the browser to accept the WebDriver Bidi connection. After it the
+     * session continues with WebDriver Classic. Node.js only.
+     */
+    bidiConnectTimeout: {
+        type: 'number',
+        default: DEFAULT_CONNECT_TIMEOUT,
+        validate: (timeout: number): boolean => {
+            if (!Number.isFinite(timeout) || timeout <= 0) {
+                throw new TypeError('The option "bidiConnectTimeout" needs to be a positive number')
+            }
+
+            return true
+        }
+    },
+    /**
+     * Override default agent
+     */
+    logLevels: {
+        type: 'object'
+    },
+    /**
+     * Pass custom headers
+     */
+    headers: {
+        type: 'object'
+    },
+    /**
+     * Function transforming the request options before the request is made
+     */
+    transformRequest: {
+        type: 'function',
+        default: (requestOptions: RequestInit) => requestOptions
+    },
+    /**
+     * Function transforming the response object after it is received
+     */
+    transformResponse: {
+        type: 'function',
+        default: (response: Options.RequestLibResponse) => response
+    },
+    /**
+     * Appium direct connect options server (https://appiumpro.com/editions/86-connecting-directly-to-appium-hosts-in-distributed-environments)
+     * Whether to allow direct connect caps to adjust endpoint details (Appium only)
+     */
+    enableDirectConnect: {
+        type: 'boolean',
+        default: true
+    },
+    /**
+     * Whether it requires SSL certificates to be valid in HTTP/s requests
+     * for an environment which cannot get process environment well.
+     */
+    strictSSL: {
+        type: 'boolean',
+        default: true
+    },
+    /**
+     * The path to the root of the cache directory. This directory is used to store all drivers that are downloaded
+     * when attempting to start a session.
+     */
+    cacheDir: {
+        type: 'string'
+    },
+    /**
+     * Mask sensitive data in logs by replacing matching string or all captured groups for the provided regular expressions as string
+     */
+    maskingPatterns: {
+        type: 'string',
+        default : undefined,
+    }
+}
+
+export const ELEMENT_KEY = 'element-6066-11e4-a52e-4f735466cecf'
+export const SHADOW_ELEMENT_KEY = 'shadow-6066-11e4-a52e-4f735466cecf'
+
+export const BASE_64_REGEX = /^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)?$/
+export const BASE_64_SAFE_STRING_TO_PROCESS_LENGTH = 200_000
+
+export const APPIUM_MASKING_HEADER = { 'x-appium-is-sensitive': 'true' }

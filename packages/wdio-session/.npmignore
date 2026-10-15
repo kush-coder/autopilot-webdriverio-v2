@@ -1,0 +1,8 @@
+src/*
+!src/skill/
+src/skill/*
+!src/skill/SKILL.md
+scripts
+tests
+tsconfig.json
+tsconfig.prod.json

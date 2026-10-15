@@ -1,0 +1,356 @@
+import type { MockedFunction } from 'vitest'
+import { vi, describe, it, expect, afterEach } from 'vitest'
+
+import * as shim from '../../src/shim.js'
+import { testFnWrapper, filterStackTrace } from '../../src/test-framework/testFnWrapper.js'
+import { setDebugAgentPause } from '../../src/test-framework/debugAgent.js'
+
+vi.mock('../../src/shim', () => ({
+    executeHooksWithArgs: vi.fn(),
+    followFrameworkTimer: vi.fn(),
+    executeAsync: async (fn: Function, { limit, attempts }: any, args = []) => fn('async', limit, attempts, ...args),
+    runSync: null,
+}))
+
+const executeHooksWithArgs = shim.executeHooksWithArgs as MockedFunction<any>
+
+describe('testFnWrapper', () => {
+    const origFn = (mode: string, limit: number, attempts: number, arg: any) => `${mode}: Foo${arg} ${limit} ${attempts}`
+    const buildArgs = (specFn: Function, retries?: number, beforeFnArgs?: Function, afterFnArgs?: Function) => [
+        'Foo',
+        { specFn, specFnArgs: ['Bar'] },
+        { beforeFn: 'beforeFn', beforeFnArgs },
+        { afterFn: 'afterFn', afterFnArgs },
+        '0-9',
+        retries
+    ]
+
+    it('should run fn in async mode if not runSync', async () => {
+        const args = buildArgs(origFn, undefined, () => [], () => []) as any[]
+        // @ts-expect-error
+        const result = await testFnWrapper(...args)
+
+        expect(result).toBe('async: FooBar 0 0')
+        expect(executeHooksWithArgs).toBeCalledTimes(2)
+        expect(executeHooksWithArgs).toBeCalledWith('beforeFoo', 'beforeFn', [])
+        expect(executeHooksWithArgs).toBeCalledWith('afterFoo', 'afterFn', [{
+            duration: expect.any(Number),
+            error: undefined,
+            result: 'async: FooBar 0 0',
+            passed: true,
+            retries: {
+                limit: 0,
+                attempts: 0
+            },
+            skipped: false
+        }])
+    })
+
+    it('should run fn in async mode if specFn is async', async () => {
+        // @ts-expect-error
+        const args = buildArgs(async (...args: any[]) => origFn(...args), 11, () => ['beforeFnArgs'], () => ['afterFnArgs'])
+        // @ts-expect-error
+        const result = await testFnWrapper(...args)
+
+        expect(result).toBe('async: FooBar 11 0')
+        expect(executeHooksWithArgs).toBeCalledTimes(2)
+        expect(executeHooksWithArgs).toBeCalledWith('beforeFoo', 'beforeFn', ['beforeFnArgs'])
+        expect(executeHooksWithArgs).toBeCalledWith('afterFoo', 'afterFn', ['afterFnArgs', {
+            duration: expect.any(Number),
+            error: undefined,
+            result: 'async: FooBar 11 0',
+            passed: true,
+            retries: {
+                limit: 11,
+                attempts: 0
+            },
+            skipped: false,
+        }])
+    })
+
+    it('should throw on error', async () => {
+        let expectedError
+        const args = buildArgs((mode: string, repeatTest: boolean, arg: any) => {
+            expectedError = new Error(`${mode}: Foo${arg} ${repeatTest}`)
+            throw expectedError
+        }, undefined, () => ['beforeFnArgs'], () => ['afterFnArgs'])
+
+        let error
+        try {
+            // @ts-expect-error
+            await testFnWrapper(...args)
+        } catch (err) {
+            error = err
+        }
+
+        expect(error).toBe(expectedError)
+        expect(executeHooksWithArgs).toBeCalledTimes(2)
+        expect(executeHooksWithArgs).toBeCalledWith('beforeFoo', 'beforeFn', ['beforeFnArgs'])
+        expect(executeHooksWithArgs).toBeCalledWith('afterFoo', 'afterFn', ['afterFnArgs', {
+            duration: expect.any(Number),
+            error: expectedError,
+            result: undefined,
+            passed: false,
+            retries: {
+                limit: 0,
+                attempts: 0
+            },
+            skipped: false,
+        }])
+    })
+
+    it('should throw on error on skip test', async () => {
+        const args = buildArgs((mode: string, repeatTest: boolean, arg: any) => {
+            throw new Error('sync skip; aborting execution')
+        }, undefined, () => ['beforeFnArgs'], () => ['afterFnArgs'])
+
+        let error
+        try {
+            // @ts-expect-error
+            await testFnWrapper(...args)
+        } catch (err) {
+            error = err
+        }
+
+        expect(error).toBeDefined()
+        expect((error as Error).message).toBe('sync skip; aborting execution')
+        expect(executeHooksWithArgs).toBeCalledTimes(2)
+        expect(executeHooksWithArgs).toBeCalledWith('beforeFoo', 'beforeFn', ['beforeFnArgs'])
+        expect(executeHooksWithArgs).toBeCalledWith('afterFoo', 'afterFn', ['afterFnArgs', {
+            duration: expect.any(Number),
+            error: undefined,
+            result: undefined,
+            passed: false,
+            retries: {
+                limit: 0,
+                attempts: 0
+            },
+            skipped: true,
+        }])
+    })
+
+    it('should throw on error on pending test (Jasmine)', async () => {
+        const pendingError = new Error('=> marked Pending: because')
+        const args = buildArgs((mode: string, repeatTest: boolean, arg: any) => {
+            throw pendingError
+        }, undefined, () => ['beforeFnArgs'], () => ['afterFnArgs'])
+
+        let error
+        try {
+            // @ts-expect-error
+            await testFnWrapper(...args)
+        } catch (err) {
+            error = err
+        }
+
+        expect(error).toBe(pendingError)
+        expect(executeHooksWithArgs).toBeCalledTimes(2)
+        expect(executeHooksWithArgs).toBeCalledWith('beforeFoo', 'beforeFn', ['beforeFnArgs'])
+        expect(executeHooksWithArgs).toBeCalledWith('afterFoo', 'afterFn', ['afterFnArgs', {
+            duration: expect.any(Number),
+            error: undefined,
+            result: undefined,
+            passed: false,
+            retries: {
+                limit: 0,
+                attempts: 0
+            },
+            skipped: true,
+        }])
+    })
+
+    it('emits the after-hook with the identity captured BEFORE the await, not a mutated one', async () => {
+        // Simulate a timeout: the framework advances context.test to the NEXT runnable while the
+        // spec body runs. afterFnArgs reads the (mutable) current identity, mocha-style:
+        // [identityObject, context]. The snapshot must freeze the ORIGINAL identity.
+        const original = { title: 'timed-out test', parent: 'suite' }
+        const next = { title: 'next test', parent: 'suite' }
+        let currentIdentity = original
+        const sharedContext = { kind: 'context' }
+        const afterFnArgs = () => [currentIdentity, sharedContext]
+
+        // The spec body 'advances the pointer' the way mocha does on timeout.
+        const specFn = () => {
+            currentIdentity = next
+            return 'done'
+        }
+
+        const args = [
+            'Test',
+            { specFn, specFnArgs: [] },
+            { beforeFn: 'beforeFn', beforeFnArgs: () => [] },
+            { afterFn: 'afterFn', afterFnArgs },
+            '0-9',
+            0
+        ] as any[]
+
+        // @ts-expect-error
+        await testFnWrapper(...args)
+
+        const afterCall = executeHooksWithArgs.mock.calls.find((c: any[]) => c[0] === 'afterTest')
+        expect(afterCall).toBeDefined()
+        const emittedArgs = afterCall![2]
+        // identity (index 0) must be the ORIGINAL runnable, never the mutated 'next' one.
+        expect(emittedArgs[0]).toBe(original)
+        expect(emittedArgs[0].title).toBe('timed-out test')
+        // the live context (index 1) is still forwarded.
+        expect(emittedArgs[1]).toBe(sharedContext)
+    })
+
+    it('falls back to an empty args array when afterFnArgs is undefined', async () => {
+        const args = [
+            'Test',
+            { specFn: () => 'ok', specFnArgs: [] },
+            { beforeFn: 'beforeFn', beforeFnArgs: () => [] },
+            { afterFn: 'afterFn', afterFnArgs: undefined },
+            '0-9',
+            0
+        ] as any[]
+
+        // @ts-expect-error
+        const result = await testFnWrapper(...args)
+        expect(result).toBe('ok')
+        const afterCall = executeHooksWithArgs.mock.calls.find((c: any[]) => c[0] === 'afterTest')
+        expect(afterCall).toBeDefined()
+        // only the pushed result object should be present (no identity since afterFnArgs was absent).
+        expect(afterCall![2]).toHaveLength(1)
+        expect(afterCall![2][0]).toMatchObject({ result: 'ok', passed: true })
+    })
+
+    it('should apply a framework spec result and filter its expectation stack', async () => {
+        const failure = {
+            matcherName: 'toBe',
+            stack: [
+                '    at spec (/foo/bar/baz/example.e2e.js:27:9)',
+                '    at Context.testFrameworkFnWrapper (/foo/bar/baz/node_modules/@wdio/utils/build/test-framework/testFnWrapper.js:50:32)'
+            ].join('\n')
+        }
+        const specResult = { id: 'spec-1', failedExpectations: [failure] }
+        const args = [
+            'Test',
+            {
+                specFn: () => 'body',
+                specFnArgs: [],
+                frameworkResult: () => ({ result: specResult, errors: specResult.failedExpectations })
+            },
+            { beforeFn: 'beforeFn', beforeFnArgs: () => [] },
+            { afterFn: 'afterFn', afterFnArgs: () => [] },
+            '0-9',
+            0
+        ] as any[]
+
+        // @ts-expect-error
+        const result = await testFnWrapper(...args)
+
+        expect(result).toBe(specResult)
+        expect(failure.stack).not.toContain('node_modules/@wdio/utils')
+        expect(failure.stack).toContain('example.e2e.js')
+        const afterCall = executeHooksWithArgs.mock.calls.find((c: any[]) => c[0] === 'afterTest')
+        expect(afterCall![2][0]).toMatchObject({
+            result: specResult,
+            error: failure,
+            passed: false
+        })
+    })
+
+    it('pauses a failed test before afterTest and close fails the test', async () => {
+        const order: string[] = []
+        executeHooksWithArgs.mockImplementation(async (name: string) => {
+            order.push(name)
+            return []
+        })
+        setDebugAgentPause(async () => {
+            order.push('pause')
+            throw new Error('Session closed from wdio session')
+        })
+        const failure = new Error('assertion failed')
+        const args = [
+            'Test',
+            { specFn: () => { throw failure }, specFnArgs: [] },
+            { beforeFn: 'beforeFn', beforeFnArgs: () => [{ title: 'reads the title', file: '/tmp/spec.ts' }] },
+            { afterFn: 'afterFn', afterFnArgs: () => [{ title: 'reads the title', file: '/tmp/spec.ts' }] },
+            '0-0',
+            0
+        ] as any[]
+
+        // @ts-expect-error test args
+        await expect(testFnWrapper(...args)).rejects.toThrow('Session closed from wdio session')
+        expect(order).toEqual(['beforeTest', 'pause', 'afterTest'])
+        const afterCall = executeHooksWithArgs.mock.calls.find((call) => call[0] === 'afterTest')
+        const report = (afterCall?.[2] as { error?: Error, passed?: boolean }[])[1]
+        expect(report.error?.message).toBe('Session closed from wdio session')
+        expect(report.passed).toBe(false)
+    })
+
+    it('pauses a failed cucumber step', async () => {
+        setDebugAgentPause(async () => {
+            throw new Error('paused on step')
+        })
+        const args = [
+            'Step',
+            { specFn: () => { throw new Error('step failed') }, specFnArgs: [] },
+            { beforeFn: 'beforeFn', beforeFnArgs: () => [{ title: 'a step', file: '/tmp/spec.ts' }] },
+            { afterFn: 'afterFn', afterFnArgs: () => [{ title: 'a step', file: '/tmp/spec.ts' }] },
+            '0-0',
+            0
+        ] as any[]
+
+        // @ts-expect-error test args
+        await expect(testFnWrapper(...args)).rejects.toThrow('paused on step')
+    })
+
+    afterEach(() => {
+        executeHooksWithArgs.mockClear()
+        setDebugAgentPause(undefined)
+    })
+})
+
+describe('filterStackTrace', () => {
+    it('should remove internal webdriverio lines only', () => {
+        const stackTraces = [
+            {
+                fullStack : `
+                    at Context.<anonymous> (/foo/bar/baz/example.e2e.js:27:9)
+                    at Context.executeAsync (/foo/bar/baz/node_modules/@wdio/utils/build/shim.js:331:27)
+                    at Context.testFrameworkFnWrapper (/foo/bar/baz/node_modules/@wdio/utils/build/test-framework/testFnWrapper.js:50:32)
+                    at processTicksAndRejections (internal/process/task_queues.js:95:5)
+                `,
+                filteredStack : `
+                    at Context.<anonymous> (/foo/bar/baz/example.e2e.js:27:9)
+                `
+            },
+            {
+                fullStack : `
+                    at implicitWait (/foo/bar/node_modules/webdriverio/build/utils/implicitWait.js:34:19)
+                    at async Element.elementErrorHandlerCallbackFn (/foo/bar/node_modules/webdriverio/build/middlewares.js:20:29)
+                    at async Element.wrapCommandFn (/foo/bar/node_modules/@wdio/utils/build/shim.js:137:29)
+                    at async Element.wrapCommandFn (/foo/bar/node_modules/some/fake/lib/bar.js:137:29)
+                    at async Context.<anonymous> (/foo/bar/test/specs/example.e2e.ts:8:9)
+                    at processTicksAndRejections (internal/process/task_queues.js:95:5)
+                `,
+                filteredStack : `
+                    at async Element.wrapCommandFn (/foo/bar/node_modules/some/fake/lib/bar.js:137:29)
+                    at async Context.<anonymous> (/foo/bar/test/specs/example.e2e.ts:8:9)
+                `
+            }
+        ]
+
+        for (const { fullStack, filteredStack } of stackTraces) {
+            expect(filteredStack).toBe(filterStackTrace(fullStack))
+        }
+    })
+
+    it('should remove invalidateCache', () => {
+        const stacktrace = `
+            at async Context.<anonymous> (/foo/bar/test/specs/example.e2e.ts:8:9)
+            at Context.testFrameworkFnWrapper (/foo/bar/baz/testFnWrapper.js?invalidateCache=0.2342342342334:50:32)
+        `
+
+        const filteredStack = `
+            at async Context.<anonymous> (/foo/bar/test/specs/example.e2e.ts:8:9)
+            at Context.testFrameworkFnWrapper (/foo/bar/baz/testFnWrapper.js:50:32)
+        `
+
+        expect(filteredStack).toBe(filterStackTrace(stacktrace))
+    })
+})

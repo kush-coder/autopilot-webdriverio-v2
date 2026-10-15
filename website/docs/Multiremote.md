@@ -1,0 +1,345 @@
+---
+id: multiremote
+title: Multi-remote
+description: "Control multiple browser or device sessions from a single test with multi-remote, in standalone mode or with the WDIO testrunner."
+---
+
+WebdriverIO allows you to run multiple automated sessions in a single test. This becomes handy when you’re testing features that require multiple users (for example, chat or WebRTC applications).
+
+Instead of creating a couple of remote instances where you need to execute common commands like [`newSession`](/docs/api/webdriver#newsession) or [`url`](/docs/api/browser/url) on each instance, you can simply create a **multi-remote** instance and control all browsers at the same time.
+
+To do so, just use the `multiRemote()` function, and pass in an object with names keyed to `capabilities` for values. By giving each capability a name, you can easily select and access that single instance when executing commands on a single instance.
+
+:::info
+
+MultiRemote is _not_ meant to execute all your tests in parallel.
+It is intended to help coordinate multiple browsers and/or mobile devices for special integration tests (e.g. chat applications).
+
+:::
+
+Most multi-remote commands return an array of results. The first result represents the capability defined first in the capability object, the second result the second capability, and so on. `mock()` returns a `MultiRemoteMock` instead of an array. See [What mock() returns](#what-mock-returns).
+
+## Using Standalone Mode
+
+Here is an example of how to create a multi-remote instance in __standalone mode__:
+
+```js
+import { multiRemote } from 'webdriverio'
+
+(async () => {
+    const browser = await multiRemote({
+        myChromeBrowser: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        myFirefoxBrowser: {
+            capabilities: {
+                browserName: 'firefox'
+            }
+        }
+    })
+
+    // open url with both browser at the same time
+    await browser.url('http://json.org')
+
+    // call commands at the same time
+    const title = await browser.getTitle()
+    expect(title).toEqual(['JSON', 'JSON'])
+
+    // click on an element at the same time
+    const elem = await browser.$('#someElem')
+    await elem.click()
+
+    // only click with one browser (Firefox)
+    await elem.getInstance('myFirefoxBrowser').click()
+})()
+```
+
+## Using WDIO Testrunner
+
+In order to use multi-remote in the WDIO testrunner, just define the `capabilities` object in your `wdio.conf.js` as an object with the browser names as keys (instead of a list of capabilities):
+
+```js
+export const config = {
+    // ...
+    capabilities: {
+        myChromeBrowser: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        myFirefoxBrowser: {
+            capabilities: {
+                browserName: 'firefox'
+            }
+        }
+    }
+    // ...
+}
+```
+
+This will create two WebDriver sessions with Chrome and Firefox. Instead of just Chrome and Firefox you can also boot up two mobile devices using [Appium](http://appium.io) or one mobile device and one browser.
+
+You can also run multi-remote in parallel by putting the browser capabilities object in an array. Please make sure to have `capabilities` field included in each browser, as this is how we tell each mode apart.
+
+```js
+export const config = {
+    // ...
+    capabilities: [{
+        myChromeBrowser0: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        myFirefoxBrowser0: {
+            capabilities: {
+                browserName: 'firefox'
+            }
+        }
+    }, {
+        myChromeBrowser1: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        myFirefoxBrowser1: {
+            capabilities: {
+                browserName: 'firefox'
+            }
+        }
+    }]
+    // ...
+}
+```
+
+You can even boot up one of the [cloud services backend](https://webdriver.io/docs/cloudservices.html) together with local Webdriver/Appium, or Selenium Standalone instances. WebdriverIO automatically detect cloud backend capabilities if you specified either of `bstack:options` ([Browserstack](https://webdriver.io/docs/browserstack-service.html)), `sauce:options` ([SauceLabs](https://webdriver.io/docs/sauce-service.html)), or `tb:options` ([TestingBot](https://webdriver.io/docs/testingbot-service.html)) in browser capabilities.
+
+```js
+export const config = {
+    // ...
+    user: process.env.BROWSERSTACK_USERNAME,
+    key: process.env.BROWSERSTACK_ACCESS_KEY,
+    capabilities: {
+        myChromeBrowser: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        myBrowserStackFirefoxBrowser: {
+            capabilities: {
+                browserName: 'firefox',
+                'bstack:options': {
+                    // ...
+                }
+            }
+        }
+    },
+    services: [
+        ['browserstack', 'selenium-standalone']
+    ],
+    // ...
+}
+```
+
+Any kind of OS/browser combination is possible here (including mobile and desktop browsers). All commands your tests call via the `browser` variable are executed in parallel with each instance. This helps streamline your integration tests and speed up their execution.
+
+For example, if you open up a URL:
+
+```js
+browser.url('https://socketio-chat-h9jt.herokuapp.com/')
+```
+
+Each command’s result will be an object with the browser names as the key, and the command result as value, like so:
+
+```js
+// wdio testrunner example
+await browser.url('https://www.whatismybrowser.com')
+
+const elem = await $('.string-major')
+const result = await elem.getText()
+
+console.log(result[0]) // returns: 'Chrome 40 on Mac OS X (Yosemite)'
+console.log(result[1]) // returns: 'Firefox 35 on Mac OS X (Yosemite)'
+```
+
+Notice that each command is executed one by one. This means that the command finishes once all browsers have executed it. This is helpful because it keeps the browser actions synced, which makes it easier to understand what’s currently happening.
+
+Sometimes it is necessary to do different things in each browser in order to test something. For instance, if we want to test a chat application, there has to be one browser who sends a text message while another browser waits to receive it, and then run an assertion on it.
+
+When using the WDIO testrunner, it registers the browser names with their instances to the global scope:
+
+```js
+const myChromeBrowser = browser.getInstance('myChromeBrowser')
+await myChromeBrowser.$('#message').setValue('Hi, I am Chrome')
+await myChromeBrowser.$('#send').click()
+
+// wait until messages arrive
+await $('.messages').waitForExist()
+// check if one of the messages contain the Chrome message
+assert.true(
+    (
+        await $$('.messages').map((m) => m.getText())
+    ).includes('Hi, I am Chrome')
+)
+```
+
+In this example, the `myFirefoxBrowser` instance will start waiting on a message once the `myChromeBrowser` instance has clicked on `#send` button.
+
+MultiRemote makes it easy and convenient to control multiple browsers, whether you want them doing the same thing in parallel, or different things in concert.
+
+### What `$` returns
+
+On a multi-remote browser, `$`, `custom$` and `react$` return one `MultiRemoteElement`. On a multi-remote element, `shadow$`, `nextElement`, `previousElement` and `parentElement` also return one. Its commands run on every instance, and `getInstance` gives the element of one browser.
+
+```js
+const host = await $('my-component')
+const button = await host.shadow$('button')
+
+await button.click()                                  // clicks in every browser
+await button.getInstance('myChromeBrowser').click()  // clicks only in Chrome
+```
+
+### What `$$` returns
+
+On a multi-remote browser, `$$` returns a `MultiRemoteElementArray`. Each entry is a `MultiRemoteElement` that addresses every instance at once, and the array itself carries the same information as a regular `ElementArray`. `custom$$`, `react$$` and, on a multi-remote element, `shadow$$` return the same kind of list.
+
+```js
+const messages = await $$('.messages')
+
+messages.length      // the largest number of elements that one instance found
+messages[0]          // a MultiRemoteElement, addressing all instances
+messages.selector    // '.messages'
+messages.foundWith   // '$$'
+messages.parent      // the multi-remote browser or element it was fetched from
+messages.isMultiRemote // true, so it can be told apart from a plain ElementArray
+
+// the async array helpers are available, as on a single browser
+await messages.map((m) => m.getText())
+await messages.filter(async (m) => await m.isDisplayed())
+```
+
+When the instances find a different number of elements, an entry has no element for an instance that found fewer. For that instance, `getInstance()` throws, and a command on the entry fails. Use `select()` with the instances that have the element. An `expect` matcher on the whole list checks each instance with its own elements:
+
+```js
+// myChromeBrowser finds 3 messages, myFirefoxBrowser finds 2
+const messages = await $$('.messages')
+
+messages.length                                       // 3
+await messages[2].select('myChromeBrowser').click()  // only Chrome has a third message
+await expect(messages).toBeElementsArrayOfSize(expect.multiRemote({
+    myChromeBrowser: 3,
+    myFirefoxBrowser: 2
+}))
+```
+
+:::info
+
+Before v10 this returned a plain array unless `WDIO_ENABLE_MULTI_REMOTE_ELEMENT_ARRAY=true` was set. The array is now the default and the environment variable has been removed. Index access is unchanged, so code that only read `elements[0]` keeps working.
+
+:::
+
+### What mock() returns {#what-mock-returns}
+
+On a multi-remote browser, `mock()` returns a `MultiRemoteMock`. It is not an array. `respond()`, `restore()`, and the other mock methods run on every instance. Captured requests stay on the mock for one browser, so read them with `getInstance`:
+
+```ts
+const mock = await browser.mock('*/users/list')
+
+mock.instances // ['myChromeBrowser', 'myFirefoxBrowser']
+mock.respond([{ id: 1 }])
+
+const chromeCalls = mock.getInstance('myChromeBrowser').calls
+const firefoxCalls = mock.getInstance('myFirefoxBrowser').calls
+```
+
+`examples/bidi/multiremote-mock.js` runs this against two headless Chrome sessions.
+
+`instances` follows the order the mocks were created. After `select()`, that order can differ from `browser.instances`:
+
+```ts
+const selected = await browser.select('myFirefoxBrowser', 'myChromeBrowser').mock('*/users/list')
+
+selected.instances // ['myFirefoxBrowser', 'myChromeBrowser']
+selected.getInstance('myChromeBrowser') // the Chrome mock, whatever the order
+```
+
+`getInstance` throws `Multi-remote object has no instance named "<name>"` when `name` is not in `instances`.
+
+To mock one browser only, call `mock()` on that instance:
+
+```ts
+const chromeOnly = await browser.getInstance('myChromeBrowser').mock('*/users/list')
+```
+
+## Accessing browser instances using strings via the browser object
+In addition to accessing the browser instance via their global variables (e.g. `myChromeBrowser`, `myFirefoxBrowser`), you can also access them via the `browser` object, e.g. `browser["myChromeBrowser"]` or `browser["myFirefoxBrowser"]`. You can get a list of all your instances via `browser.instances`. This is especially useful when writing re-usable test steps that can be performed in either browser, e.g.:
+
+wdio.conf.js:
+```js
+    capabilities: {
+        userA: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        },
+        userB: {
+            capabilities: {
+                browserName: 'chrome'
+            }
+        }
+    }
+```
+
+Cucumber file:
+    ```feature
+    When User A types a message into the chat
+    ```
+
+Step definition file:
+```js
+When(/^User (.) types a message into the chat/, async (userId) => {
+    await browser.getInstance(`user${userId}`).$('#message').setValue('Hi, I am Chrome')
+    await browser.getInstance(`user${userId}`).$('#send').click()
+})
+```
+
+## Assertions
+
+The `expect` matchers support multi-remote browsers, elements and mocks. By default, every instance must match the expected value:
+
+```js
+import { multiRemoteBrowser, expect } from '@wdio/globals'
+
+await expect(multiRemoteBrowser).toHaveTitle('My App')
+await expect(multiRemoteBrowser.$('h1')).toHaveText('Welcome')
+```
+
+To expect a different value per instance, use `expect.multiRemote()` with one value per instance name:
+
+```js
+import { multiRemoteBrowser, expect } from '@wdio/globals'
+
+await expect(multiRemoteBrowser).toHaveTitle(expect.multiRemote({
+    myChromeBrowser: 'My App',
+    myFirefoxBrowser: expect.stringContaining('App')
+}))
+```
+
+For all the supported matchers and the required configuration, see the [expect-webdriverio multi-remote guide](https://github.com/webdriverio/expect-webdriverio/blob/main/docs/MultiRemote.md).
+
+## Accessing one instance
+
+Instance names are not properties of the multi-remote browser or of a multi-remote element. `browser.myChromeBrowser` and `elem.myChromeDriver` are not set. Ask for the session with `getInstance`, or narrow the multi-remote object with `select`:
+
+```ts
+const myChromeBrowser = browser.getInstance('myChromeBrowser')
+await myChromeBrowser?.$$('button')
+
+const myChromeElement = (await browser.$('button')).getInstance('myChromeBrowser')
+await myChromeElement.click()
+
+await browser.select('myChromeBrowser').url('https://webdriver.io')
+```
+
+The testrunner still assigns each instance name as its own global when `injectGlobals` is left on, so a test can call `myChromeBrowser.$('button')` without going through `browser`. That global is the single session from `getInstance`, not a field on the multi-remote object.

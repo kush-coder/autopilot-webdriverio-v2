@@ -1,0 +1,49 @@
+{
+  "name": "@wdio/junit-reporter",
+  "version": "10.0.1",
+  "description": "A WebdriverIO reporter that creates Jenkins compatible XML based JUnit reports",
+  "author": "Christian Bromann <mail@bromann.dev>",
+  "homepage": "https://github.com/webdriverio/webdriverio/tree/main/packages/wdio-junit-reporter",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webdriverio/webdriverio.git",
+    "directory": "packages/wdio-junit-reporter"
+  },
+  "keywords": [
+    "webdriver",
+    "wdio",
+    "wdio-reporter",
+    "junit",
+    "reporter"
+  ],
+  "bugs": {
+    "url": "https://github.com/webdriverio/webdriverio/issues"
+  },
+  "type": "module",
+  "types": "./build/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js",
+      "requireSource": "./src/common/api.ts",
+      "require": "./build/index.cjs"
+    }
+  },
+  "typeScriptVersion": "6.0.3",
+  "dependencies": {
+    "@wdio/reporter": "workspace:*",
+    "@wdio/types": "workspace:*",
+    "json-stringify-safe": "^5.0.1",
+    "junit-report-builder": "^5.1.2"
+  },
+  "devDependencies": {
+    "@types/json-stringify-safe": "^5.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,54 @@
+packages:
+  - 'packages/**'
+  - 'infra/**'
+  - 'website/**'
+  - 'e2e/**'
+  - 'tests/**'
+  - 'tests/typings/**'
+  - 'examples/wdio/**'
+  - 'examples/standalone/**'
+  - 'examples/pageobject/**'
+  - 'examples/cloudservices/**'
+  - 'examples/bidi/**'
+  - 'examples/appium/**'
+  - '!e2e/session/__fixtures__/**'
+
+# only sharp runs its install script; the rest work without theirs
+allowBuilds:
+  sharp: true
+  '@swc/core': false
+  appium: false
+  core-js: false
+  edgedriver: false
+  esbuild: false
+  geckodriver: false
+  nx: false
+
+# first-party releases for v10 published inside pnpm's minimumReleaseAge window:
+# expect-webdriverio 8.0.0 and @wdio/visual-service 11.0.0 (with
+# @wdio/image-comparison-core 3.0.0) on 2026-10-10, and the driver majors
+# (2026-10-09). The entries can go once they are older than minimumReleaseAge.
+minimumReleaseAgeExclude:
+  - expect-webdriverio@8.0.0
+  - '@wdio/visual-service@11.0.0'
+  - '@wdio/image-comparison-core@3.0.0'
+  - edgedriver@8.0.0
+  - geckodriver@8.0.0
+  - safaridriver@3.0.0
+
+# security fixes for transitive dependencies (GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f, GHSA-pqg4-j6r4-53mv)
+overrides:
+  handlebars: 4.7.10
+  shell-quote: 1.12.0
+
+# recast's declared @babel/parser range cannot parse the pipeline operator
+packageExtensions:
+  recast@0.23.11:
+    dependencies:
+      '@babel/parser': 7.29.8
+  recast@0.23.21:
+    dependencies:
+      '@babel/parser': 7.29.8
+  recast@0.24.0:
+    dependencies:
+      '@babel/parser': 7.29.8

@@ -1,0 +1,426 @@
+import logger from '@wdio/logger'
+import { type CustomCommands, MESSAGE_TYPES, workerProcessEvent, type Workers } from '@wdio/types'
+import _mitt from 'mitt'
+
+import { resolveCustomCommandOptions } from './customCommands.js'
+import { commandCallStructure, overwriteElementCommands } from './utils.js'
+
+const SCOPE_TYPES: Record<string, Function> = {
+    browser: /* istanbul ignore next */ function Browser() { },
+    element: /* istanbul ignore next */ function Element() { }
+}
+
+/**
+ * @see https://github.com/developit/mitt/issues/191
+ */
+const mitt = _mitt as unknown as typeof _mitt.default
+const EVENTHANDLER_FUNCTIONS = ['on', 'off', 'emit', 'once', 'removeListener', 'removeAllListeners'] as const
+
+interface PropertiesObject {
+    [key: string | symbol]: PropertyDescriptor
+}
+
+function composeElementOverrides(previousCommand: Function | undefined, nextCommand: Function): Function {
+    if (!previousCommand) {
+        return nextCommand
+    }
+
+    const previousElementCommand = previousCommand
+
+    return function composedElementOverride(this: WebdriverIO.Element, originalCommand: Function, ...args: unknown[]) {
+        const element = this
+
+        function previousCommandAsOriginal(this: WebdriverIO.Element, ...previousArgs: unknown[]) {
+            const context = this || element
+
+            function originalForPrevious(this: WebdriverIO.Element, ...originalArgs: unknown[]) {
+                return originalCommand.apply(this || context, originalArgs)
+            }
+
+            return previousElementCommand.call(context, originalForPrevious, ...previousArgs)
+        }
+
+        return nextCommand.call(element, previousCommandAsOriginal, ...args)
+    }
+}
+
+function setElementOverride(overrides: Record<string, Function>, name: string, command: Function): void {
+    overrides[name] = composeElementOverrides(overrides[name], command)
+}
+
+export default function WebDriver(options: object, modifier?: Function, properties: PropertiesObject = {}) {
+    /**
+     * In order to allow named scopes for elements we have to propagate that
+     * info within the `propertiesObject` object. This doesn't have any functional
+     * advantages just provides better description of objects when debugging them
+     */
+    const scopeType = SCOPE_TYPES[properties.scope?.value || 'browser']
+
+    const prototype = Object.create(scopeType.prototype)
+    const log = logger('webdriver')
+
+    const mittInstance = mitt()
+
+    type EventHandler = (event: unknown) => void
+    const dialogListeners: Array<{ listener: EventHandler, registered: EventHandler }> = []
+
+    const emitDialogListenerTransition = (previousCount: number) => {
+        if (previousCount === 0 && dialogListeners.length > 0) {
+            mittInstance.emit('_dialogListenerRegistered')
+        } else if (previousCount > 0 && dialogListeners.length === 0) {
+            mittInstance.emit('_dialogListenerRemoved')
+        }
+    }
+
+    const addDialogListener = (listener: EventHandler, registered = listener) => {
+        const previousCount = dialogListeners.length
+        mittInstance.on('dialog', registered)
+        dialogListeners.push({ listener, registered })
+        emitDialogListenerTransition(previousCount)
+    }
+
+    const removeDialogListener = (listener?: EventHandler, registered?: EventHandler) => {
+        const previousCount = dialogListeners.length
+        let index = -1
+
+        for (let i = dialogListeners.length - 1; i >= 0; i--) {
+            const entry = dialogListeners[i]
+            if (registered ? entry.registered === registered : entry.listener === listener) {
+                index = i
+                break
+            }
+        }
+
+        if (index === -1) {
+            return
+        }
+
+        const [entry] = dialogListeners.splice(index, 1)
+        mittInstance.off('dialog', entry.registered)
+        emitDialogListenerTransition(previousCount)
+    }
+
+    const removeAllDialogListeners = () => {
+        const previousCount = dialogListeners.length
+        mittInstance.off('dialog')
+        dialogListeners.length = 0
+        emitDialogListenerTransition(previousCount)
+    }
+
+    // Create EventEmitter-compatible interface
+    const eventHandler = {
+        on: (type: string, handler: EventHandler) => {
+            if (type === 'dialog') {
+                addDialogListener(handler)
+            } else {
+                mittInstance.on(type, handler)
+            }
+        },
+        off: (type: string, handler?: EventHandler) => {
+            if (type === 'dialog') {
+                if (handler) {
+                    removeDialogListener(handler)
+                } else {
+                    removeAllDialogListeners()
+                }
+            } else {
+                mittInstance.off(type, handler)
+            }
+        },
+        emit: mittInstance.emit.bind(mittInstance),
+        once: (type: string, handler: EventHandler) => {
+            const onceWrapper = (event: unknown) => {
+                if (type === 'dialog') {
+                    removeDialogListener(handler, onceWrapper)
+                } else {
+                    mittInstance.off(type, onceWrapper)
+                }
+                handler(event)
+            }
+
+            if (type === 'dialog') {
+                addDialogListener(handler, onceWrapper)
+            } else {
+                mittInstance.on(type, onceWrapper)
+            }
+        },
+        removeListener: (type: string, handler?: EventHandler) => {
+            if (type === 'dialog') {
+                if (handler) {
+                    removeDialogListener(handler)
+                } else {
+                    removeAllDialogListeners()
+                }
+            } else {
+                mittInstance.off(type, handler)
+            }
+        },
+        removeAllListeners: (type?: string) => {
+            if (type === 'dialog') {
+                removeAllDialogListeners()
+            } else if (type) {
+                mittInstance.off(type)
+            } else {
+                const previousCount = dialogListeners.length
+                mittInstance.off('dialog')
+                dialogListeners.length = 0
+                emitDialogListenerTransition(previousCount)
+                mittInstance.all.clear()
+            }
+        }
+    }
+
+    /**
+     * WebDriver monad
+     */
+    function unit(this: void, sessionId: string, commandWrapper?: Function, elementCmdImplicitWaitExclusionList?: string[]) {
+        /**
+         * The client gets its own map of the property descriptors, and a new descriptor
+         * for each command that it wraps or overrides: the descriptors of the caller do
+         * not change. A caller can give the same object to the monad of many clients,
+         * e.g. `getElements` to all items of a list. Wrapped in place, the commands of
+         * each new client were wrapped again: item `[n]` had `n + 1` layers.
+         */
+        const propertiesObject: PropertiesObject = { ...properties }
+        delete propertiesObject.scope
+
+        /**
+         * capabilities attached to the instance prototype not being shown if
+         * logging the instance
+         */
+        propertiesObject.commandList = { value: Object.keys(propertiesObject) }
+        propertiesObject.options = { value: options }
+        if ('requestedCapabilities' in options) {
+            propertiesObject.requestedCapabilities = { value: options.requestedCapabilities }
+        }
+
+        /**
+         * allow to wrap commands if necessary
+         * e.g. in wdio-cli to allow element chaining
+         */
+        if (typeof commandWrapper === 'function') {
+            for (const [commandName, descriptor] of Object.entries(propertiesObject)) {
+                const { value } = descriptor
+                /**
+                 * no need to apply a command wrapper if:
+                 * - there is no wrapper
+                 * - command is an event handler function
+                 */
+                if (typeof value !== 'function' || Object.keys(EVENTHANDLER_FUNCTIONS).includes(commandName)) {
+                    continue
+                }
+
+                propertiesObject[commandName] = {
+                    ...descriptor,
+                    value: commandWrapper(commandName, value, propertiesObject),
+                    configurable: true
+                }
+            }
+        }
+
+        /**
+         * overwrite native element commands with user defined
+         */
+        overwriteElementCommands.call(this, propertiesObject)
+
+        /**
+         * assign propertiesObject to itself so the client can be recreated
+         */
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { puppeteer, ...propertiesObjectWithoutPuppeteer } = propertiesObject
+        propertiesObject.__propertiesObject__ = { value: propertiesObjectWithoutPuppeteer }
+
+        let client = Object.create(prototype, propertiesObject)
+        client.sessionId = sessionId
+
+        /**
+         * register capabilities only to browser scope
+         */
+        if (scopeType.name === 'Browser' && 'capabilities' in options) {
+            client.capabilities = options.capabilities
+        }
+
+        if (typeof modifier === 'function') {
+            client = modifier(client, options)
+        }
+
+        client.addCommand = function (name: string, func: Function | Promise<unknown>, options?: CustomCommands.CustomCommandOptions<boolean>) {
+            const { attachToElement, disableElementImplicitWait, proto: _proto, instances: _instances } = resolveCustomCommandOptions('addCommand', options)
+
+            const customCommand = typeof commandWrapper === 'function'
+                ? commandWrapper(name, func)
+                : func
+            if (attachToElement) {
+                if (disableElementImplicitWait && elementCmdImplicitWaitExclusionList && !elementCmdImplicitWaitExclusionList.includes(name)) {
+                    elementCmdImplicitWaitExclusionList.push(name)
+                }
+
+                /**
+                 * add command to every multi-remote instance
+                 */
+                if (_instances) {
+                    Object.values(_instances).forEach((instance: { __propertiesObject__: Record<string, unknown> }) => {
+                        instance.__propertiesObject__[name] = {
+                            value: customCommand
+                        }
+                    })
+                }
+
+                this.__propertiesObject__[name] = { value: customCommand }
+            } else {
+                unit.lift(name, customCommand, _proto)
+            }
+
+            /**
+             * When running component tests, custom commands might not be recognised when services attach them to the browser.
+             * This is because the `addCommand` function is called within the Node.js environment and not the browser.
+             * As a workaround, we check here if we are in a worker process and if so we send a message to the parent process
+             * to add the command to the browser.
+             *
+             * @todo(Christian): this won't be sufficient, e.g. in cases where the page is reloaded and the command is not re-added.
+             */
+            const workerId = process.env.WDIO_WORKER_ID
+            if (typeof process.send === 'function' && workerId) {
+                const message: Workers.WorkerEvent = {
+                    origin: 'worker',
+                    name: 'workerEvent',
+                    args: workerProcessEvent(MESSAGE_TYPES.customCommand, {
+                        commandName: name,
+                        cid: workerId,
+                    })
+                }
+                process.send(message)
+            }
+        }
+
+        /**
+         * overwriteCommand
+         * @param  {string}   name     command name to be overwritten
+         * @param  {Function} func     function to replace original command with;
+         *                             takes original function as first argument.
+         * @param  {Object=}  options  `{ attachToElement, proto, instances }`
+         */
+        client.overwriteCommand = function (name: string, func: Function, options?: CustomCommands.CustomCommandOptions<boolean>) {
+            const { attachToElement, proto, instances } = resolveCustomCommandOptions('overwriteCommand', options)
+            const customCommand = typeof commandWrapper === 'function'
+                ? commandWrapper(name, func)
+                : func
+            if (attachToElement) {
+                if (instances) {
+                    /**
+                     * add command to every multi-remote instance
+                     */
+                    Object.values(instances).forEach((instance: { __propertiesObject__: { __elementOverrides__: { value: Record<string, Function> } } }) => {
+                        setElementOverride(instance.__propertiesObject__.__elementOverrides__.value, name, customCommand)
+                    })
+                } else {
+                    /**
+                     * regular mode
+                     */
+                    setElementOverride(this.__propertiesObject__.__elementOverrides__.value, name, customCommand)
+                }
+            } else if (client[name]) {
+                const origCommand = client[name]
+                delete client[name]
+                unit.lift(name, customCommand, proto, (...args: unknown[]) => origCommand.apply(this, args))
+            } else {
+                throw new Error('overwriteCommand: no command to be overwritten: ' + name)
+            }
+        }
+
+        return client
+    }
+
+    /**
+     * Enhance monad prototype with function
+     * @param  {string}   name          name of function to attach to prototype
+     * @param  {Function} func          function to be added to prototype
+     * @param  {Object}   proto         prototype to add function to (optional)
+     * @param  {Function} origCommand   original command to be passed to custom command as first argument
+     */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    unit.lift = function (name: string, func: Function, proto?: Record<string, any>, origCommand?: Function) {
+        (proto || prototype)[name] = function next(...args: unknown[]) {
+            log.info('COMMAND', commandCallStructure(name, args))
+            this.emit('command', { command: name, body: args })
+
+            /**
+             * set name of function for better error stack
+             */
+            Object.defineProperty(func, 'name', {
+                value: name,
+                writable: false,
+            })
+
+            try {
+                const result = func.apply(this, origCommand ? [origCommand, ...args] : args)
+
+                // When the result is a promise, we want to emit on then & catch
+                if (isPromiseLike(result)) {
+                    result.then((res: unknown) => {
+
+                        const elem = res as { elementId: string, selector?: string }
+                        let resultLog = res
+                        if (elem instanceof SCOPE_TYPES.element) {
+                            resultLog = `WebdriverIO.Element<${elem.elementId || elem.selector}>`
+                        } else if (res instanceof SCOPE_TYPES.browser) {
+                            resultLog = 'WebdriverIO.Browser'
+                        }
+
+                        log.info('RESULT', resultLog)
+                        this.emit('result', {
+                            command: name,
+                            result: { value: res }
+                        })
+                    }).catch((error: Error) => {
+                        this.emit('result', { command: name, result: { error } })
+                    })
+                } else {
+                    // The function should always be a promise and not trigger the below, but for the sake of being bullet proof let's do it
+                    // When a function we can emit the result immediately
+                    this.emit('result', { command: name, result: { value: result } })
+                }
+
+                return result
+            } catch (error) {
+                // The function should always be a promise and not trigger this error but for the sake of being bullet proof let's do it
+                this.emit('result', { command: name, result: { error } })
+                throw error
+            }
+        }
+    }
+
+    /**
+     * register event emitter
+     */
+    for (const eventCommand of EVENTHANDLER_FUNCTIONS) {
+        prototype[eventCommand] = function (...args: [unknown, unknown]) {
+            // Call the appropriate method based on eventCommand
+            switch (eventCommand) {
+            case 'on':
+                eventHandler.on(args[0] as string, args[1] as (event: unknown) => void)
+                break
+            case 'off':
+            case 'removeListener':
+                eventHandler.off(args[0] as string, args[1] as (event: unknown) => void)
+                break
+            case 'emit':
+                eventHandler.emit(args[0] as string, args[1])
+                break
+            case 'once':
+                eventHandler.once(args[0] as string, args[1] as (event: unknown) => void)
+                break
+            case 'removeAllListeners':
+                eventHandler.removeAllListeners(args[0] as string)
+                break
+            }
+            return this
+        }
+    }
+
+    return unit
+}
+
+const isPromiseLike = (value: unknown): value is Promise<unknown> => {
+    return value !== null && typeof value === 'object' && typeof (value as Promise<unknown>).then === 'function' && typeof (value as Promise<unknown>).catch === 'function'
+}

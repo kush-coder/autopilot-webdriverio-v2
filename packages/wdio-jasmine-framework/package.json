@@ -1,0 +1,65 @@
+{
+  "name": "@wdio/jasmine-framework",
+  "version": "10.0.2",
+  "description": "A WebdriverIO plugin. Adapter for Jasmine testing framework.",
+  "author": "Christian Bromann <mail@bromann.dev>",
+  "homepage": "https://github.com/webdriverio/webdriverio/tree/main/packages/wdio-jasmine-framework",
+  "license": "MIT",
+  "type": "module",
+  "types": "./build/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./build/index.js",
+      "types": "./build/index.d.ts"
+    }
+  },
+  "typeScriptVersion": "6.0.3",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webdriverio/webdriverio.git",
+    "directory": "packages/wdio-jasmine-framework"
+  },
+  "keywords": [
+    "jasmine",
+    "webdriverio",
+    "wdio",
+    "wdio-plugin",
+    "wdio-framework",
+    "webdriver"
+  ],
+  "bugs": {
+    "url": "https://github.com/webdriverio/webdriverio/issues"
+  },
+  "dependencies": {
+    "@types/jasmine": "^6.0.0",
+    "@types/node": "^22.20.4",
+    "@wdio/globals": "workspace:*",
+    "@wdio/logger": "workspace:*",
+    "@wdio/types": "workspace:*",
+    "@wdio/utils": "workspace:*",
+    "jasmine": "^6.3.0"
+  },
+  "devDependencies": {
+    "@wdio/runner": "workspace:*",
+    "expect-webdriverio": "^8.0.0",
+    "webdriverio": "workspace:*"
+  },
+  "peerDependencies": {
+    "@wdio/runner": "^10.0.0-0 || ^10.0.0",
+    "webdriverio": "^10.0.0-0 || ^10.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@wdio/runner": {
+      "optional": false
+    },
+    "webdriverio": {
+      "optional": false
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

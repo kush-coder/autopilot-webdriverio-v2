@@ -1,0 +1,565 @@
+import fs from 'node:fs'
+import path from 'node:path'
+
+import logger from '@wdio/logger'
+import { getContextManager } from 'webdriverio'
+import { RefRegistry, refId, type RefErrorCode, type SnapshotNode } from '@wdio/snapshot'
+
+import { ACTION_MAP } from './actions/specs.js'
+import { PAGE_LOAD_TIMEOUT_MS } from './actions/interact.js'
+import { IMPLEMENTATIONS, type ActionArgs } from './actions/index.js'
+import { SessionError, usage } from './errors.js'
+import { cmdWith, type Cmd, type HintFormatter } from './hints.js'
+import { History } from './history.js'
+import { RingBuffer, type LogEntry, type NetworkEntry } from './daemon/events.js'
+import { backToTop, describeNewTabs, dialogOpenError, frame as enterFrame, holdFrame, openDialog } from './actions/contexts.js'
+import { OBSERVED_ACTIONS, describeChanges, pageState, type PageState } from './actions/changes.js'
+import { failedRequestNote, networkMark } from './network-notes.js'
+import { botCheckNote, detectBotCheck, detectLoadError } from './actions/botcheck.js'
+import type { AgentActionResult, PageChange, PageInfo } from './agent/types.js'
+import type { ActionResult, Applies, OpenPlan, PlatformKind, Request } from './types.js'
+
+const log = logger('@wdio/session')
+
+const DEAD_SESSION_PATTERNS = [
+    /invalid session id/i,
+    /session deleted because of page crash/i,
+    /no such session/i,
+    /ECONNREFUSED/,
+    /chrome not reachable/i,
+    /disconnected: not connected to DevTools/i,
+    /Session .* does not exist/i,
+    /A session is either terminated or not started/i
+]
+
+/**
+ * the frame or page an action ran in went away, the browser didn't: a frame
+ * that reloaded (bot checks replace their widget every few seconds) or a page
+ * that navigated while the action ran
+ */
+/**
+ * A change report that is empty, or whose changed lines differ only in which
+ * element has focus. A report without changed lines but with text (a new
+ * page's summary) is a change.
+ */
+function onlyFocusMoved (report = '') {
+    if (!report.trim()) {
+        return true
+    }
+    const changed = report.split('\n').filter((line) => /^[+-] /.test(line))
+    return changed.length > 0 && changed.every((line) => / \[focused\]/.test(line))
+}
+
+/** actions that say so when the page shows no change after them */
+const NO_EFFECT_NOTED = new Set(['click', 'tap'])
+const CONTEXT_GONE = /browsing context has been discarded|no such frame/i
+
+/**
+ * actions that do not touch the page and keep working while a dialog blocks it
+ */
+/**
+ * actions that can open a tab: a link with `target="_blank"`, a form that
+ * submits into one, a script calling `window.open`
+ */
+const NAVIGATIONS = new Set(['navigate', 'back', 'forward', 'reload'])
+const TAB_OPENERS =new Set(['click', 'tap', 'press', 'select', 'check', 'uncheck'])
+
+/** actions that show the network buffer themselves */
+const NETWORK_READERS = new Set(['requests', 'logs'])
+
+const DIALOG_SAFE_ACTIONS = new Set(['dialog', 'info', 'close', 'resume', 'logs', 'requests', 'history', 'export', 'helpers', 'trace', 'record'])
+
+export function isDeadSessionError (err: unknown) {
+    const message = (err as Error)?.message || String(err)
+    return DEAD_SESSION_PATTERNS.some((p) => p.test(message))
+}
+
+export interface SessionInit {
+    name: string
+    cwd: string
+    artifactsDir: string
+    runtimeDir: string
+    browser: WebdriverIO.Browser
+    plan: OpenPlan
+    keepHistory?: boolean
+    /**
+     * `false` keeps the step history in memory instead of `history.json`
+     */
+    persistHistory?: boolean
+    hint?: HintFormatter
+}
+
+export interface ActionOutcome extends ActionResult {
+    /**
+     * code appended to the history, `undefined` records nothing
+     */
+    history?: string
+}
+
+export type ActionFn = (session: Session, args: ActionArgs) => Promise<ActionOutcome>
+
+/**
+ * A `wdio session` instance: one WebdriverIO browser object plus the
+ * state that actions share (refs, history, event buffers, …).
+ */
+export class Session {
+    readonly name: string
+    readonly cwd: string
+    readonly artifactsDir: string
+    readonly runtimeDir: string
+    readonly plan: OpenPlan
+    readonly cmd: Cmd
+    browser: WebdriverIO.Browser
+    history: History
+    refs = new RefRegistry({
+        createError: (code, message, { resnapshot }) => new SessionError(code, message, { hint: resnapshot ? this.#refHint(code) : undefined })
+    })
+    logs = new RingBuffer<LogEntry>()
+    network = new RingBuffer<NetworkEntry>()
+    lastSnapshot?: string
+    /** page as of the last observed action, the baseline for the next one's changes */
+    lastPage?: PageState
+    /** document (context and URL) a snapshot already waited for; unset by a navigation, so the next snapshot waits again */
+    settledKey?: string
+    /** settle key of the document the latest web snapshot read */
+    pageKey?: string
+    /**
+     * arbitrary per-feature state (mocks, emulation, trace, visual, …)
+     */
+    store = new Map<string, unknown>()
+    /**
+     * set by the daemon, called when the session must shut down
+     */
+    onShutdown?: (reason: 'close' | 'died' | 'resume', err?: SessionError) => void
+    /**
+     * set by the test runner bridge
+     */
+    onResume?: () => void
+    /**
+     * the socket server serving this session
+     */
+    server?: { close: (err?: SessionError) => Promise<void> }
+    /**
+     * cleanup callbacks run on shutdown (mocks, recordings, watchers, …)
+     */
+    disposers: (() => unknown)[] = []
+    #pending = new Set<string>()
+    #pageLoadLimited = false
+    // the frame an action entered for one of its refs went away while it ran
+    #heldFrameGone = false
+    // grows when the server gives up on a running action (see `abandon`)
+    #epoch = 0
+    #restoreHeldFrame?: () => void
+    // network entries up to here were reported with an action's result
+    #networkReported = 0
+
+    constructor (init: SessionInit) {
+        this.name = init.name
+        this.cwd = init.cwd
+        this.artifactsDir = init.artifactsDir
+        this.runtimeDir = init.runtimeDir
+        this.browser = init.browser
+        this.plan = init.plan
+        this.cmd = cmdWith(init.hint)
+        fs.mkdirSync(this.artifactsDir, { recursive: true })
+        this.history = new History(this.artifactsDir, { keep: init.keepHistory, persist: init.persistHistory })
+    }
+
+    frameHint = (ref: string) => this.cmd('frame', { target: ref }, `wdio session frame ${ref}`)
+
+    #refHint (code: RefErrorCode) {
+        return code === 'REF_NOT_FOUND'
+            ? `Run \`${this.cmd('snapshot', undefined, 'wdio session snapshot')}\` to get refs.`
+            : `Run \`${this.cmd('snapshot', undefined, 'wdio session snapshot')}\` to get fresh refs.`
+    }
+
+    get applies (): Applies[] {
+        return this.plan.applies
+    }
+
+    get platform (): PlatformKind {
+        return this.plan.platform
+    }
+
+    get isWeb () {
+        return this.applies.includes('W')
+    }
+
+    get isBidi () {
+        return Boolean((this.browser as unknown as { isBidi?: boolean }).isBidi)
+    }
+
+    artifact (...segments: string[]) {
+        const file = path.join(this.artifactsDir, ...segments)
+        fs.mkdirSync(path.dirname(file), { recursive: true })
+        return file
+    }
+
+    timestamp () {
+        return new Date().toISOString().replace(/[:.]/g, '-')
+    }
+
+    get<T> (key: string): T | undefined {
+        return this.store.get(key) as T | undefined
+    }
+
+    set (key: string, value: unknown) {
+        this.store.set(key, value)
+    }
+
+    requireBidi (feature: string) {
+        if (!this.isBidi) {
+            throw new SessionError('BIDI_REQUIRED', `${feature} needs WebDriver BiDi and this session has none.`, {
+                hint: 'Reopen the session without --no-bidi, with a BiDi capable browser (Chrome, Edge, Firefox).'
+            })
+        }
+    }
+
+    /**
+     * The URL of the current tab. In a BiDi session it comes from the
+     * browsing context tree: chromedriver holds a classic `getUrl` while any
+     * frame of the page navigates, which on pages full of ads is most of
+     * the time, for up to the page load timeout.
+     */
+    async currentUrl ({ throwOnError = false } = {}) {
+        if (!this.isWeb) {
+            return undefined
+        }
+        if (this.isBidi) {
+            try {
+                const context = await getContextManager(this.browser).getCurrentContext()
+                const { contexts } = await this.browser.browsingContextGetTree({ root: context, maxDepth: 0 })
+                if (contexts[0]?.url) {
+                    return contexts[0].url
+                }
+            } catch {
+                // fall back to the classic command
+            }
+        }
+        try {
+            return await this.browser.getUrl()
+        } catch (err) {
+            // `get url` and `wait --url` report the driver's error, not a missing URL
+            if (throwOnError) {
+                throw err
+            }
+            return undefined
+        }
+    }
+
+    async dispose () {
+        for (const fn of this.disposers.splice(0).reverse()) {
+            try {
+                await fn()
+            } catch (err) {
+                log.warn(`Cleanup step failed: ${(err as Error).message}`)
+            }
+        }
+    }
+
+    async currentPath () {
+        if (!this.isWeb) {
+            return undefined
+        }
+        try {
+            return new URL(await this.currentUrl() ?? '').pathname
+        } catch {
+            return undefined
+        }
+    }
+
+    /**
+     * Run a request. Requests are serialized by the server.
+     */
+    /**
+     * WebDriver waits up to five minutes for a page to load after a click or
+     * a navigation. Pages full of ads and trackers can take that long, and the
+     * session can't do anything else meanwhile. An agent is better served by
+     * the page as it is after a while: actions report "still loading" instead
+     * (see `withNavigation`). A `timeouts.pageLoad` capability wins.
+     */
+    async limitPageLoad () {
+        if (this.#pageLoadLimited || !this.isWeb) {
+            return
+        }
+        this.#pageLoadLimited = true
+        const requested = (this.plan?.capabilities as { timeouts?: { pageLoad?: number } } | undefined)?.timeouts?.pageLoad
+        if (requested === undefined && typeof this.browser.setTimeout === 'function') {
+            await Promise.resolve(this.browser.setTimeout({ pageLoad: PAGE_LOAD_TIMEOUT_MS })).catch(() => {})
+        }
+    }
+
+    /**
+     * The server stopped waiting for the running action and serves the next
+     * request. The action can't be cancelled, but when it finishes it no
+     * longer changes the session: no frame switch, page state or history.
+     */
+    abandon () {
+        this.#epoch++
+        // the frame the action entered for a ref goes back at once, not when it finishes
+        this.#restoreHeldFrame?.()
+        this.#restoreHeldFrame = undefined
+    }
+
+    async dispatch (req: Pick<Request, 'action' | 'args' | 'cwd'>, opts: { timeout?: number, detail?: boolean } = {}): Promise<AgentActionResult> {
+        const epoch = this.#epoch
+        const abandoned = () => new SessionError('TIMEOUT', `"${req.action}" finished after it was given up; its result is dropped.`)
+        await this.limitPageLoad()
+        const spec = ACTION_MAP.get(req.action)
+        const impl = IMPLEMENTATIONS[req.action]
+        if (!spec) {
+            throw usage(`Unknown action "${req.action}".`, `Run \`${this.cmd('help', undefined, 'wdio session --help')}\` for the list of actions.`)
+        }
+        if (spec.applies && !spec.applies.some((a) => this.applies.includes(a))) {
+            throw new SessionError('NOT_SUPPORTED', `"${req.action}" is not supported for ${this.plan.label} sessions.`)
+        }
+        if (!impl) {
+            throw new SessionError('NOT_SUPPORTED', `"${req.action}" is not available in this version of @wdio/session.`)
+        }
+        const dialog = openDialog(this)
+        if (dialog && !DIALOG_SAFE_ACTIONS.has(req.action)) {
+            throw dialogOpenError(dialog, this.cmd)
+        }
+        const args: ActionArgs = { ...req.args, $cwd: req.cwd || this.cwd, ...(opts.timeout ? { $timeout: opts.timeout } : {}) }
+        const trace = this.get<{ before: (a: string, args: ActionArgs) => Promise<void>, after: (a: string, args: ActionArgs, r?: ActionOutcome, e?: SessionError) => Promise<void> }>('trace')
+        const pagePath = spec.mutation || req.action === 'exec' ? await this.currentPath() : undefined
+        await trace?.before(req.action, args)
+        // page scripts can't run while a dialog is open, so there is no report then
+        const observe = this.isWeb && OBSERVED_ACTIONS.has(req.action) && process.env.WDIO_SESSION_CHANGES !== '0' && !dialog
+        const before = observe ? (this.lastPage ?? await pageState(this)) : undefined
+        // `click --new-tab` reports its tab itself
+        const tabsBefore = observe && TAB_OPENERS.has(req.action) && !args.newTab
+            ? await this.browser.getWindowHandles().catch(() => undefined)
+            : undefined
+        let changes: PageChange | undefined
+        let noVisibleChange: boolean | undefined
+        const notes: string[] = []
+        const networkFrom = this.#networkReported
+        // exec is observed for its page changes but returns a value, often JSON that a note would break
+        const textNotes = req.action === 'snapshot' || (OBSERVED_ACTIONS.has(req.action) && req.action !== 'exec')
+        try {
+            const outcome = await this.#inFrameOf(req.action, args, () => impl(this, args))
+            if (epoch !== this.#epoch) {
+                throw abandoned()
+            }
+            if (NAVIGATIONS.has(req.action)) {
+                this.settledKey = undefined
+            }
+            const newTabs = tabsBefore && await describeNewTabs(this, tabsBefore)
+            if (newTabs) {
+                outcome.text = [outcome.text, newTabs].filter(Boolean).join('\n')
+            }
+            if (before && openDialog(this)) {
+                this.lastPage = undefined
+            } else if (before) {
+                // another frame is another document: list it rather than diff it
+                const { text, change, after } = req.action === 'frame'
+                    ? await describeChanges(this, {}, this.get('frame') ? 'Frame' : 'Page')
+                    : await describeChanges(this, before)
+                // no text means no answer in time (see describeChanges): start over next time
+                this.lastPage = after.text ? after : undefined
+                changes = change
+                if (text) {
+                    outcome.text = [outcome.text, text].filter(Boolean).join('\n')
+                }
+                // a click that did nothing looks like one that worked; agents repeat it
+                if (after.text && NO_EFFECT_NOTED.has(req.action) && onlyFocusMoved(text)) {
+                    outcome.text = [outcome.text, 'No visible change on the page.'].filter(Boolean).join('\n')
+                    noVisibleChange = true
+                }
+            } else if (spec.mutation || req.action === 'exec' || req.action === 'wait') {
+                // the page may have changed without a report (scroll, drag, code,
+                // content that loaded while waiting): the next report starts over
+                this.lastPage = undefined
+            }
+            const snapshotData = outcome.data as { snapshot?: string, tree?: SnapshotNode } | undefined
+            const pageText = req.action === 'snapshot' ? snapshotData?.snapshot ?? outcome.text : observe ? this.lastPage?.text : undefined
+            if (this.isWeb && pageText) {
+                const note = detectLoadError(pageText) ?? await this.#botCheck(pageText)
+                if (note) {
+                    notes.push(note)
+                }
+                outcome.text = [outcome.text, note].filter(Boolean).join('\n')
+            }
+            if (NETWORK_READERS.has(req.action)) {
+                this.#networkReported = networkMark(this.network)
+            } else if (opts.detail || textNotes) {
+                const failed = failedRequestNote(this.network.all().filter((entry) => entry.seq > networkFrom))
+                if (failed) {
+                    notes.push(failed)
+                    if (textNotes) {
+                        outcome.text = [outcome.text, failed].filter(Boolean).join('\n')
+                    }
+                    this.#networkReported = networkMark(this.network)
+                }
+            }
+            let page: PageInfo | undefined
+            if (opts.detail) {
+                if (req.action === 'snapshot' && this.isWeb && snapshotData?.tree) {
+                    page = { url: await this.currentUrl(), title: snapshotData.tree.role === 'document' ? snapshotData.tree.name : undefined }
+                } else if (this.lastPage) {
+                    page = { url: this.lastPage.url, title: this.lastPage.title }
+                }
+            }
+            if (outcome.history) {
+                this.history.append({
+                    kind: req.action === 'exec' ? 'exec' : 'action',
+                    code: outcome.history,
+                    action: req.action,
+                    args: stripInternal(args),
+                    path: pagePath
+                })
+            }
+            await trace?.after(req.action, args, outcome)
+            const { history: _history, ...result } = outcome
+            return opts.detail
+                ? { ...result, ...(changes ? { changes } : {}), ...(noVisibleChange ? { noVisibleChange } : {}), ...(page ? { page } : {}), ...(notes.length ? { notes } : {}) }
+                : result
+        } catch (err) {
+            if (epoch !== this.#epoch) {
+                // a timeout says so itself (exec gives up on its code and reports what it printed)
+                throw err instanceof SessionError && (err.code === 'TIMEOUT' || err.message.includes('given up')) ? err : abandoned()
+            }
+            // a failed action may still have changed the page
+            if (before || spec.mutation || req.action === 'exec') {
+                this.lastPage = undefined
+            }
+            let error = SessionError.from(err, req.action === 'exec' ? 'EXEC_ERROR' : 'INTERNAL')
+            if (!(err instanceof SessionError) && CONTEXT_GONE.test(error.message)) {
+                // a frame entered for a ref is left again before this runs
+                const inFrame = this.#heldFrameGone || Boolean(this.get('activeContext'))
+                await backToTop(this).catch(() => {})
+                this.lastPage = undefined
+                error = new SessionError('CONTEXT_GONE', inFrame
+                    ? 'The frame went away while the action ran (it reloaded or was removed). The session is back on the top document.'
+                    : 'The page went away while the action ran (it navigated or closed).', {
+                    hint: inFrame
+                        ? `Run \`${this.cmd('snapshot', { interactive: true }, 'wdio session snapshot -i')}\` and enter the new frame with \`${this.cmd('frame', { target: '<ref>' }, 'wdio session frame <ref>')}\`.`
+                        : `Run \`${this.cmd('snapshot', { interactive: true }, 'wdio session snapshot -i')}\` to see where the tab is now, or \`${this.cmd('tabs', undefined, 'wdio session tabs')}\`.`,
+                    details: (err as Error)?.message
+                })
+            } else if (!(err instanceof SessionError) && isDeadSessionError(err)) {
+                error = new SessionError('SESSION_DIED', `The ${this.plan.label} session went away: ${error.message}`, {
+                    hint: `Open a new session with \`${this.cmd('open', undefined, 'wdio session open')}\`.`
+                })
+                setTimeout(() => this.onShutdown?.('died', error), 50)
+            } else if (error.code === 'INTERNAL') {
+                if (this.plan.target !== 'agent') {
+                    error.hint = error.hint || `See ${path.join(this.artifactsDir, 'daemon.log')} for details.`
+                }
+                log.error(`Action "${req.action}" failed: ${(err as Error)?.stack || err}`)
+            }
+            await trace?.after(req.action, args, undefined, error).catch(() => {})
+            throw error
+        }
+    }
+
+    /**
+     * Run an action on a ref from a frame the snapshot showed inline (see
+     * `inlineFrames`) inside that frame, then go back to the top document.
+     * The recorded code enters the frame in a block of its own, so it
+     * replays on its own.
+     */
+    async #inFrameOf (action: string, args: ActionArgs, run: () => Promise<ActionOutcome>): Promise<ActionOutcome> {
+        this.#heldFrameGone = false
+        const epoch = this.#epoch
+        if (!this.isBidi) {
+            return run()
+        }
+        const frameOf = (value: unknown) => {
+            const id = typeof value === 'string' ? refId(value) : undefined
+            return id ? this.refs.get(id)?.frame : undefined
+        }
+        if (action === 'frame') {
+            return this.#enterNestedFrame(frameOf(args.target), run)
+        }
+        const frames = new Set([args.target, args.from, args.to, args.scope]
+            .map(frameOf)
+            .filter((frame): frame is string => Boolean(frame)))
+        if (!frames.size) {
+            return run()
+        }
+        if (frames.size > 1) {
+            throw usage('These refs are in different frames.', 'Act on one frame at a time.')
+        }
+        const [frame] = frames
+        const current = this.get<string>('frame')
+        if (current === frame || current?.startsWith(`${frame} `)) {
+            return run()
+        }
+        const held = await holdFrame(this, frame)
+        this.#restoreHeldFrame = held.restore
+        let outcome: ActionOutcome
+        try {
+            outcome = await run()
+        } catch (err) {
+            this.#heldFrameGone = !(err instanceof SessionError) && CONTEXT_GONE.test((err as Error)?.message ?? '')
+            throw err
+        } finally {
+            // an abandoned action gave the frame back in `abandon` already
+            if (epoch === this.#epoch) {
+                this.#restoreHeldFrame = undefined
+                await held.release().catch(() => {})
+            }
+        }
+        const wrap = (code?: string) => code
+            ? ['{', ...[...held.lines, ...code.split('\n')].map((line) => `    ${line}`), '}'].join('\n')
+            : code
+        return { ...outcome, history: wrap(outcome.history), code: wrap(outcome.code) }
+    }
+
+    /**
+     * `frame <ref>` for an iframe inside a frame the snapshot showed inline:
+     * that element is in the outer frame's document, so enter that frame first.
+     */
+    async #enterNestedFrame (outer: string | undefined, run: () => Promise<ActionOutcome>): Promise<ActionOutcome> {
+        const stack = this.get<string[]>('frameStack') || []
+        if (!outer || (stack.length === 1 && (stack[0] === outer || stack[0].startsWith(`${outer} `)))) {
+            return run()
+        }
+        await backToTop(this)
+        const entered = await enterFrame(this, { target: outer, $cwd: this.cwd })
+        try {
+            const outcome = await run()
+            const join = (a?: string, b?: string) => [a, b].filter(Boolean).join('\n') || undefined
+            return { ...outcome, code: join(entered.code, outcome.code), history: join(entered.history, outcome.history) }
+        } catch (err) {
+            await backToTop(this).catch(() => {})
+            throw err
+        }
+    }
+
+    /**
+     * A note when the page is a bot check, once per URL: agents otherwise
+     * spend dozens of steps waiting on it or clicking it.
+     */
+    async #botCheck (snapshot: string) {
+        const vendor = detectBotCheck(snapshot)
+        const url = await this.currentUrl()
+        if (!vendor) {
+            this.set('botCheckUrl', undefined)
+            return undefined
+        }
+        if (this.get('botCheckUrl') === url) {
+            return undefined
+        }
+        this.set('botCheckUrl', url)
+        const headless = this.plan.headless !== false
+        const userAgent = headless
+            ? await Promise.resolve(this.browser.execute(() => navigator.userAgent)).catch(() => undefined)
+            : undefined
+        return botCheckNote(vendor, { headless, target: String(this.plan.target ?? 'chrome'), url, userAgent: typeof userAgent === 'string' ? userAgent : undefined }, this.cmd)
+    }
+
+    /**
+     * track long running async work (e.g. timed out exec) for logging
+     */
+    trackPending (id: string, promise: Promise<unknown>) {
+        this.#pending.add(id)
+        promise.finally(() => this.#pending.delete(id)).catch(() => {})
+    }
+}
+
+function stripInternal (args: ActionArgs) {
+    return Object.fromEntries(Object.entries(args).filter(([k]) => !k.startsWith('$')))
+}

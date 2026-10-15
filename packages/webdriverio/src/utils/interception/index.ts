@@ -1,0 +1,1277 @@
+import logger from '@wdio/logger'
+import type { JsonCompatible } from '@wdio/types'
+import { setWdioKind } from '@wdio/utils'
+import { type local, type remote } from 'webdriver'
+import { URLPattern } from 'urlpattern-polyfill'
+
+import Timer from '../Timer.js'
+import { encodeBase64, decodeBase64 } from '../base64.js'
+import { parseOverwrite, getPatternParam } from './utils.js'
+import { SESSION_MOCKS } from '../../commands/browser/mock.js'
+import type { MockFilterOptions, RequestWithOptions, RespondWithOptions, Response } from './types.js'
+import type { WaitForOptions } from '../../types.js'
+import { logBackgroundError } from '../sessionEnded.js'
+
+const log = logger('WebDriverInterception')
+
+const DEFAULT_SPY_COLLECTED_BODY_SIZE = 10 * 1024 * 1024
+
+/**
+ * the session id that each browser subscribed to the network events and added a data
+ * collector for. Each session needs its own: a second session in the same process, a
+ * new session after `reloadSession()` and each multi-remote instance. A WeakMap keeps
+ * one entry per browser object, so ended sessions are not retained.
+ */
+const subscribedSessions = new WeakMap<WebdriverIO.Browser, string | undefined>()
+
+/**
+ * A request paused by the driver is released exactly once, however many mocks
+ * intercepted it. Every mock registers its own `network.addIntercept` and its own
+ * event listener, so when two mocks match the same request they both try to
+ * release it and the driver rejects the second attempt with "Invalid state for
+ * continueInterceptedRequest" / "Invalid InterceptionId.". Nobody awaits an event
+ * handler, so that rejection escapes as an unhandled rejection.
+ *
+ * The listeners of one BiDi event all receive the same parameter object, so the
+ * event itself carries the mark. `beforeRequestSent` and `responseStarted` are
+ * separate pause points that arrive as separate objects, which is what keeps a
+ * request releasable once per phase. The event also reports which intercepts
+ * blocked it, so a request that only one intercept blocked takes no mark at all
+ * and behaves exactly as before.
+ *
+ * A `postData` filter cannot decide until `network.getData` returns. That read
+ * is recorded on the same event, and a mock that declines waits for it. A
+ * microtask is too early: it runs before the body arrives and would continue
+ * the request out from under the mock that still means to abort or overwrite it.
+ */
+const RELEASED = Symbol('wdio.interception.released')
+const PENDING = Symbol('wdio.interception.pending')
+
+type InterceptedEvent = { intercepts?: string[] }
+type MarkedEvent = InterceptedEvent & {
+    [RELEASED]?: true
+    [PENDING]?: Promise<void>[]
+}
+
+function isContested(event: InterceptedEvent) {
+    return Boolean(event.intercepts && event.intercepts.length > 1)
+}
+
+function isClaimed(event: InterceptedEvent) {
+    return Boolean((event as MarkedEvent)[RELEASED])
+}
+
+function claim(event: InterceptedEvent) {
+    const claimable = event as MarkedEvent
+    if (claimable[RELEASED]) {
+        return false
+    }
+
+    claimable[RELEASED] = true
+    return true
+}
+
+/**
+ * Remember a decision that yields before it knows whether it owns the request.
+ * A declining mock waits for these before it releases. The rejection is
+ * swallowed here so a failed body lookup still lets someone else release.
+ */
+function trackPending(event: InterceptedEvent, decision: Promise<unknown>) {
+    const marked = event as MarkedEvent
+    const pending = marked[PENDING] ?? (marked[PENDING] = [])
+    const settled = decision.then(() => undefined, () => undefined)
+    pending.push(settled)
+    void settled.finally(() => {
+        const index = pending.indexOf(settled)
+        if (index !== -1) {
+            pending.splice(index, 1)
+        }
+    })
+}
+
+function pendingDecisions(event: InterceptedEvent) {
+    const pending = (event as MarkedEvent)[PENDING]
+    return pending ? pending.slice() : []
+}
+
+type RespondBodyValue = string | JsonCompatible | ArrayBufferView | ArrayBuffer
+type RespondBody = RespondBodyValue | ((request: local.NetworkResponseCompletedParameters) => RespondBodyValue)
+interface Overwrite {
+    overwrite?: RequestWithOptions | RespondWithOptions
+    once?: boolean
+    abort?: boolean
+}
+
+type RequestWithPostData<T extends local.NetworkBeforeRequestSentParameters | Response> = T & {
+    postData?: string
+}
+
+function toStringBody(payload: unknown) {
+    if (typeof payload === 'string') {
+        return payload
+    }
+
+    /**
+     * `JSON.stringify` is typed as returning `string`, but at runtime it returns
+     * `undefined` for values it cannot serialize (functions, symbols, undefined).
+     * Fail loudly instead of silently sending an invalid BiDi body.
+     */
+    const serialized = JSON.stringify(payload) as string | undefined
+    if (typeof serialized !== 'string') {
+        throw new Error(
+            `Failed to serialize mock.respond() payload of type "${typeof payload}". ` +
+            'The response body must be a string, ArrayBufferView, ArrayBuffer, or JSON-serializable value.'
+        )
+    }
+
+    return serialized
+}
+
+function decodeHeader(value: local.NetworkBytesValue) {
+    return value.type === 'string'
+        ? value.value
+        : UTF8_DECODER.decode(decodeBase64(value.value))
+}
+
+const getArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!
+const UTF8_DECODER = new TextDecoder('utf-8', { ignoreBOM: true })
+
+function isArrayBuffer(value: unknown): value is ArrayBuffer {
+    try {
+        getArrayBufferByteLength.call(value)
+        return true
+    } catch {
+        // The native getter rejects non-ArrayBuffers across realms without consulting Symbol.species.
+        return false
+    }
+}
+
+function toNetworkBody(payload: RespondBodyValue): remote.NetworkBytesValue {
+    if (ArrayBuffer.isView(payload)) {
+        const bytes = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
+        return { type: 'base64', value: encodeBase64(bytes) }
+    }
+    if (isArrayBuffer(payload)) {
+        return { type: 'base64', value: encodeBase64(new Uint8Array(payload)) }
+    }
+
+    return { type: 'string', value: toStringBody(payload) }
+}
+
+/**
+ * Network interception class based on a WebDriver Bidi implementation.
+ *
+ * Note: this code is executed in Node.js and in the browser, so make sure
+ *       you use primitives that work in both environments.
+ */
+export default class WebDriverInterception {
+    #pattern: URLPattern
+    #patternId: string
+    #mockId: string
+    /**
+     * The `SESSION_MOCKS` key `mock()` stored this interception under
+     */
+    #sessionKey?: string
+    /**
+     * Restores a mock of a held context when that context closes
+     */
+    #onContextDestroyed?: (params: { context: string }) => void
+    #warnedAboutEarlyAnswer = false
+    #filterOptions: MockFilterOptions
+    #browser: WebdriverIO.Browser
+
+    #eventHandler: Map<string, Function[]> = new Map()
+    #restored = false
+    #requestOverwrites: Overwrite[] = []
+    #respondOverwrites: Overwrite[] = []
+    #calls: Response[] = []
+    #overwrittenResponseBodies = new Map<string, remote.NetworkBytesValue>()
+    #requestPostData = new Map<string, string>()
+    #isCollectingNetworkData: boolean
+    #hasOneResponseCollected = false
+    #hasOneBodyReadStarted = false
+    #blockedRequests = new Set<string>()
+    #requestsRespondedWithoutFetch = new Set<string>()
+
+    constructor(
+        pattern: URLPattern,
+        mockId: string,
+        filterOptions: MockFilterOptions,
+        browser: WebdriverIO.Browser,
+        isCollectingNetworkData = false,
+        sessionKey?: string,
+        contexts?: string[]
+    ) {
+        this.#sessionKey = sessionKey
+        this.#pattern = pattern
+        this.#patternId = getPatternId(pattern)
+        this.#mockId = mockId
+        this.#filterOptions = filterOptions
+        this.#browser = browser
+        this.#isCollectingNetworkData = isCollectingNetworkData
+
+        /**
+         * attach network listener to this mock
+         */
+        browser.on('network.beforeRequestSent', this.#handleBeforeRequestSent.bind(this))
+        browser.on('network.responseStarted', this.#handleResponseStarted.bind(this))
+        browser.on('network.responseCompleted', this.#handleResponseCompleted.bind(this))
+
+        /**
+         * A mock of a held context ends with it. Chromium keeps an intercept
+         * whose only context is gone and then matches it for every context,
+         * which would block requests of the other tabs.
+         */
+        if (contexts?.length) {
+            this.#onContextDestroyed = ({ context }) => {
+                if (contexts.includes(context)) {
+                    this.restore().catch(() => { /* the intercept may already be gone */ })
+                }
+            }
+            browser.on('browsingContext.contextDestroyed', this.#onContextDestroyed)
+        }
+    }
+
+    static async initiate(
+        url: string | URLPattern | globalThis.URLPattern,
+        filterOptions: MockFilterOptions,
+        browser: WebdriverIO.Browser,
+        scope: { contexts?: string[], sessionKey?: string } = {}
+    ) {
+        const pattern = parseUrlPattern(url)
+        const isCollectingNetworkData = browser.options.maxSpyCollectedBodySize !== 0
+
+        if (!subscribedSessions.has(browser) || subscribedSessions.get(browser) !== browser.sessionId) {
+            await browser.sessionSubscribe({
+                events: [
+                    'network.beforeRequestSent',
+                    'network.responseStarted',
+                    'network.responseCompleted'
+                ]
+            })
+            try {
+                if (isCollectingNetworkData) {
+                    await browser.networkAddDataCollector({
+                        dataTypes: ['request', 'response'],
+                        maxEncodedDataSize: typeof browser.options.maxSpyCollectedBodySize === 'number'
+                            ? browser.options.maxSpyCollectedBodySize
+                            : DEFAULT_SPY_COLLECTED_BODY_SIZE
+                    })
+                }
+            } catch (error) {
+                // Log a warning instead of failing the test
+                log.warn(`[BiDi] network.addDataCollector not supported: ${(error as Error)?.message}`)
+            }
+            log.info('subscribed to network events')
+            subscribedSessions.set(browser, browser.sessionId)
+        }
+
+        /**
+         * register network intercept
+         */
+        const interception = await browser.networkAddIntercept({
+            ...(scope.contexts ? { contexts: scope.contexts } : {}),
+            phases: ['beforeRequestSent', 'responseStarted'],
+            urlPatterns: [{
+                type: 'pattern',
+                protocol: getPatternParam(pattern, 'protocol'),
+                hostname: getPatternParam(pattern, 'hostname'),
+                pathname: getPatternParam(pattern, 'pathname'),
+                port: getPatternParam(pattern, 'port'),
+                search: getPatternParam(pattern, 'search')
+            }]
+        })
+
+        return new WebDriverInterception(pattern, interception.intercept, filterOptions, browser, isCollectingNetworkData, scope.sessionKey, scope.contexts)
+    }
+
+    #emit(event: string, args: unknown) {
+        if (!this.#eventHandler.has(event)) {
+            return
+        }
+
+        const handlers = this.#eventHandler.get(event) || []
+        for (const handler of handlers) {
+            handler(args)
+        }
+    }
+
+    #addEventHandler(event: string, handler: Function) {
+        if (!this.#eventHandler.has(event)) {
+            this.#eventHandler.set(event, [])
+        }
+
+        const handlers = this.#eventHandler.get(event)
+        handlers?.push(handler)
+    }
+
+    /**
+     * Release a paused request, unless another mock listening to the same event
+     * has already released it.
+     *
+     * `handling` says whether this mock is the one the request belongs to. A mock
+     * that only releases because the request does *not* match it must not take the
+     * release away from a mock that does. Listeners of one event run synchronously,
+     * so it waits until that dispatch finishes. A `postData` match also has to
+     * read the body first, and that decision is recorded on the event before the
+     * listener yields. The declining mock waits for those decisions too, then
+     * releases only if nobody claimed the request.
+     */
+    #release<T>(event: InterceptedEvent, handling: boolean, call: () => T): T | undefined {
+        if (!isContested(event)) {
+            return call()
+        }
+
+        if (handling) {
+            return claim(event) ? call() : undefined
+        }
+
+        if (!isClaimed(event)) {
+            queueMicrotask(() => {
+                const release = () => {
+                    if (claim(event)) {
+                        call()
+                    }
+                }
+                const pending = pendingDecisions(event)
+                if (pending.length === 0) {
+                    release()
+                    return
+                }
+
+                void Promise.all(pending).then(release)
+            })
+        }
+
+        return undefined
+    }
+
+    #handleBeforeRequestSent(request: local.NetworkBeforeRequestSentParameters) {
+        if (this.#restored) {
+            // If restored during in-flight request, continue it to prevent hanging
+            if (request.intercepts?.includes(this.#mockId)) {
+                return this.#release(request, false, () => this.#browser.networkContinueRequest({
+                    request: request.request.request
+                }).catch(() => { /* ignore errors for restored mocks */ }))
+            }
+            return
+        }
+        /**
+         * don't do anything if:
+         * - request is not blocked
+         * - request is not matching the pattern, e.g. a different mock is responsible for this request
+         */
+        if (!this.#isRequestMatching(request)) {
+            /**
+             * if request is not matching pattern but blocked by this mock (due to catch-all),
+             * we need to continue the request
+             */
+            if (request.intercepts?.includes(this.#mockId)) {
+                return this.#release(request, false, () => this.#browser.networkContinueRequest({
+                    request: request.request.request
+                }).catch(this.#handleNetworkProvideResponseError))
+            }
+            return
+        }
+
+        if (this.#filterOptions.postData) {
+            /**
+             * method and request headers are known before the body. A miss there
+             * declines the request, so reading the body would only delay the
+             * release — and, when another mock is waiting on this decision, stall
+             * it for as long as `network.getData` takes.
+             */
+            if (!this.#matchesFilterOptions(request, { includePostData: false })) {
+                return this.#release(request, false, () => this.#browser.networkContinueRequest({
+                    request: request.request.request
+                }).catch(this.#handleNetworkProvideResponseError))
+            }
+
+            const decision = this.#handleBeforeRequestSentWithPostData(request)
+            if (isContested(request)) {
+                trackPending(request, decision)
+            }
+            return decision
+        }
+
+        return this.#continueBeforeRequestSent(request)
+    }
+
+    /**
+     * `fetchResponse: false` answers before a response exists. Callbacks are
+     * typed to receive one, so give them the status this mock sends by default.
+     * A callback can still replace that status.
+     */
+    #eventForEarlyResponse(request: local.NetworkBeforeRequestSentParameters) {
+        return {
+            ...request,
+            response: {
+                status: 200,
+                headers: []
+            }
+        }
+    }
+
+    async #handleBeforeRequestSentWithPostData(request: local.NetworkBeforeRequestSentParameters) {
+        await this.#populateRequestPostData(request)
+        /**
+         * method and requestHeaders already ran before the body lookup.
+         * Evaluating them again would call a function filter twice, so a
+         * stateful filter could accept the request and then reject it.
+         */
+        return this.#continueBeforeRequestSent(request, { requestFiltersMatch: true })
+    }
+
+    #continueBeforeRequestSent(
+        request: local.NetworkBeforeRequestSentParameters,
+        { requestFiltersMatch = false }: { requestFiltersMatch?: boolean } = {}
+    ) {
+        /**
+         * check if request matches filter option and do nothing if not.
+         * When the cheaper filters already matched, only the body is left.
+         */
+        const matches = requestFiltersMatch
+            ? this.#matchesPostDataFilter(request as RequestWithPostData<local.NetworkBeforeRequestSentParameters>)
+            : this.#matchesFilterOptions(request)
+        if (!matches) {
+            return this.#release(request, false, () => this.#browser.networkContinueRequest({
+                request: request.request.request
+            }).catch(this.#handleNetworkProvideResponseError))
+        }
+
+        const requestId = request.request.request
+        this.#emit('request', request)
+
+        /**
+         * `abort()` fails the request before a response exists. An early mock
+         * response must not skip that, or an `abortOnce()` would stay queued
+         * and the request would succeed.
+         */
+        if (this.#requestOverwrites[0]?.abort) {
+            const { abort } = this.#requestOverwrites[0].once
+                ? this.#requestOverwrites.shift() || {}
+                : this.#requestOverwrites[0]
+
+            if (abort) {
+                this.#emit('fail', requestId)
+                return this.#release(request, true, () => this.#withBlockedRequestTracking(
+                    requestId,
+                    this.#browser.networkFailRequest({ request: requestId }).catch(this.#handleNetworkProvideResponseError)
+                ))
+            }
+        }
+
+        const responseOverwrite = this.#respondOverwrites[0]
+        /**
+         * `fetchResponse: false` answers here and does not continue the request.
+         * `respond()` rejects this option when the mock filters on the response,
+         * because that filter can only be decided by calling the backend.
+         */
+        if (
+            responseOverwrite?.overwrite &&
+            (
+                ('fetchResponse' in responseOverwrite.overwrite && responseOverwrite.overwrite.fetchResponse === false) ||
+                this.#mustAnswerBeforeRequestSent()
+            )
+        ) {
+            const { overwrite } = responseOverwrite.once
+                ? this.#respondOverwrites.shift() || {}
+                : responseOverwrite
+
+            if (!overwrite) {
+                return
+            }
+
+            this.#emit('overwrite', request)
+            try {
+                const responseData = parseOverwrite(
+                    overwrite as RespondWithOptions,
+                    this.#eventForEarlyResponse(request)
+                )
+                if (responseData.body) {
+                    this.#overwrittenResponseBodies.set(requestId, responseData.body)
+                }
+                this.#requestsRespondedWithoutFetch.add(requestId)
+                return this.#withBlockedRequestTracking(
+                    requestId,
+                    this.#browser.networkProvideResponse({
+                        request: requestId,
+                        statusCode: 200,
+                        ...responseData
+                    }).catch((err) => {
+                        this.#requestsRespondedWithoutFetch.delete(requestId)
+                        return this.#handleNetworkProvideResponseError(err)
+                    })
+                )
+            } catch (err) {
+                this.#requestsRespondedWithoutFetch.delete(requestId)
+                log.error(`Failed to apply mock.respond() overwrite: ${(err as Error).message}`)
+                return this.#withBlockedRequestTracking(
+                    requestId,
+                    this.#browser.networkFailRequest({
+                        request: requestId
+                    }).catch(this.#handleNetworkProvideResponseError)
+                )
+            }
+        }
+
+        const hasRequestOverwrites = this.#requestOverwrites.length > 0
+        if (hasRequestOverwrites) {
+            const { overwrite } = this.#requestOverwrites[0].once
+                ? this.#requestOverwrites.shift() || {}
+                : this.#requestOverwrites[0]
+
+            this.#emit('overwrite', request)
+            return this.#release(request, true, () => this.#withBlockedRequestTracking(
+                requestId,
+                this.#browser.networkContinueRequest({
+                    request: requestId,
+                    ...(overwrite ? parseOverwrite(overwrite, request) : {})
+                }).catch(this.#handleNetworkProvideResponseError)
+            ))
+        }
+
+        this.#emit('continue', requestId)
+        return this.#release(request, true, () => this.#withBlockedRequestTracking(
+            requestId,
+            this.#browser.networkContinueRequest({
+                request: requestId
+            }).catch(this.#handleNetworkProvideResponseError)
+        ))
+    }
+
+    #handleResponseStarted(request: Response) {
+        if (this.#restored) {
+            // If restored during in-flight request, provide response to prevent hanging
+            if (request.intercepts?.includes(this.#mockId)) {
+                return this.#release(request, false, () => this.#browser.networkProvideResponse({
+                    request: request.request.request
+                }).catch(() => { /* ignore errors for restored mocks */ }))
+            }
+            return
+        }
+        /**
+         * don't do anything if the request does not match the pattern, e.g. a
+         * different mock is responsible for this request
+         */
+        const isHandledByThisMock = request.intercepts?.includes(this.#mockId)
+        const urlMatches = this.#pattern && this.#pattern.test(request.request.url)
+        if (!urlMatches) {
+            /**
+             * if request is not matching pattern but blocked by this mock (due to catch-all),
+             * we need to continue the request
+             */
+            if (isHandledByThisMock && request.isBlocked) {
+                return this.#release(request, false, () => this.#browser.networkProvideResponse({
+                    request: request.request.request
+                }).catch(this.#handleNetworkProvideResponseError))
+            }
+            return
+        }
+
+        this.#attachPostData(request)
+
+        const filterMatches = this.#matchesFilterOptions(request)
+        if (filterMatches) {
+            /**
+             * record matching requests even when the driver did not mark them as "blocked"
+             * (e.g. subresources loaded while navigating) so `calls`/`waitForResponse()`
+             * resolve correctly
+             */
+            this.#calls.push(request)
+        }
+
+        /**
+         * A response provided during `beforeRequestSent` still causes Chrome to
+         * emit `responseStarted`, but there is no longer a paused request to
+         * release at this phase.
+         */
+        if (this.#requestsRespondedWithoutFetch.delete(request.request.request)) {
+            return
+        }
+
+        /**
+         * only requests the driver paused ("blocked") need to be continued or
+         * provided a response; non-blocked requests are not paused, so calling
+         * `networkProvideResponse` on them fails at the protocol layer
+         */
+        if (!request.isBlocked) {
+            return
+        }
+
+        /**
+         * continue mock if not matching filter
+         */
+        if (!filterMatches) {
+            this.#emit('continue', request.request.request)
+            return this.#release(request, false, () => this.#browser.networkProvideResponse({
+                request: request.request.request
+            }).catch(this.#handleNetworkProvideResponseError))
+        }
+
+        const requestId = request.request.request
+
+        /**
+         * continue response as mock has no respond overwrites
+         */
+        if (
+            this.#respondOverwrites.length === 0 ||
+            !this.#respondOverwrites[0].overwrite
+        ) {
+            this.#emit('continue', requestId)
+            return this.#release(request, true, () => this.#withBlockedRequestTracking(
+                requestId,
+                this.#browser.networkProvideResponse({
+                    request: requestId
+                }).catch(this.#handleNetworkProvideResponseError)
+            ))
+        }
+
+        const { overwrite } = this.#respondOverwrites[0].once
+            ? this.#respondOverwrites.shift() || {}
+            : this.#respondOverwrites[0]
+
+        /**
+         * continue request (possibly with overwrites)
+         */
+        if (overwrite) {
+            this.#emit('overwrite', request)
+            try {
+                const responseData = parseOverwrite(overwrite, request)
+                if (responseData.body) {
+                    this.#overwrittenResponseBodies.set(requestId, responseData.body)
+                }
+                return this.#release(request, true, () => this.#withBlockedRequestTracking(
+                    requestId,
+                    this.#browser.networkProvideResponse({
+                        request: requestId,
+                        ...responseData,
+                    }).catch((err: Error) => this.#handleUnsupportedOverwrite(err, requestId))
+                ))
+            } catch (err) {
+                /**
+                 * BiDi event dispatch swallows listener exceptions, which would leave the
+                 * intercepted request blocked and hang the browser. Fail the request so the
+                 * mock error is visible instead of stalling the test.
+                 */
+                log.error(`Failed to apply mock.respond() overwrite: ${(err as Error).message}`)
+                return this.#release(request, true, () => this.#withBlockedRequestTracking(
+                    requestId,
+                    this.#browser.networkFailRequest({
+                        request: requestId
+                    }).catch(this.#handleNetworkProvideResponseError)
+                ))
+            }
+        }
+
+        /**
+         * continue request as is
+         */
+        this.#emit('continue', requestId)
+        return this.#release(request, true, () => this.#withBlockedRequestTracking(
+            requestId,
+            this.#browser.networkProvideResponse({
+                request: requestId
+            }).catch(this.#handleNetworkProvideResponseError)
+        ))
+    }
+
+    async #handleResponseCompleted(response: Response) {
+        if (this.#restored) {
+            return
+        }
+        /**
+         * don't do anything if:
+         * - request is not matching the pattern
+         * - data collection is disabled
+         */
+        if (
+            this.#browser.options.maxSpyCollectedBodySize === 0 ||
+            !this.#pattern.test(response.request.url) ||
+            !this.#matchesFilterOptions(response, { includePostData: false })
+        ) {
+            return
+        }
+
+        const requestWithPostData = await this.#populateRequestPostData(response)
+        if (!this.#matchesPostDataFilter(requestWithPostData)) {
+            this.#requestPostData.delete(response.request.request)
+            return
+        }
+
+        const call = this.#getCall(response.request.request)
+        if (!call) {
+            return
+        }
+
+        this.#attachPostData(call)
+        this.#hasOneBodyReadStarted = true
+
+        /**
+         * try populate response body
+         */
+        try {
+            const { bytes } = await this.#browser.networkGetData({
+                request: response.request.request,
+                dataType: 'response'
+            })
+
+            if (bytes) {
+                call.body = bytes.value
+            }
+        } catch (err: unknown) {
+            log.debug(`Failed to get response body for ${response.request.request}: ${(err as Error).message}`)
+        } finally {
+            /**
+             * the body read can settle after `waitForResponse()` continued without it and
+             * `clear()` removed this call: it must not count for the next responses
+             */
+            if (this.#calls.includes(call)) {
+                this.#hasOneResponseCollected = true
+            }
+            this.#requestPostData.delete(response.request.request)
+        }
+    }
+
+    /**
+     * It appears that the networkProvideResponse method may throw an "no such request" error even though the request
+     * is marked as "blocked", in these cases we can safely ignore the error.
+     * @param err Bidi message error
+     */
+    /**
+     * Firefox only takes a response body in `network.provideResponse` while
+     * the request is blocked in `beforeRequestSent`, not once the response
+     * started (https://wpt.fyi/results/webdriver/tests/bidi/network/provide_response).
+     * Answer there, like `fetchResponse: false`, unless the mock filters on the
+     * response, which needs the backend.
+     */
+    #mustAnswerBeforeRequestSent () {
+        if (!this.#browser.isFirefox) {
+            return false
+        }
+        if (this.#filterOptions.statusCode !== undefined || this.#filterOptions.responseHeaders !== undefined) {
+            return false
+        }
+        if (!this.#warnedAboutEarlyAnswer) {
+            this.#warnedAboutEarlyAnswer = true
+            log.warn(
+                'Firefox can not replace a response body after the request was sent. ' +
+                'mock.respond() answers before the request is sent instead, as with `fetchResponse: false`.'
+            )
+        }
+        return true
+    }
+
+    /**
+     * A browser that can't replace the body once the response started rejects
+     * `network.provideResponse`, which would leave the request blocked. Let the
+     * real response through and say so, instead of hanging the test.
+     */
+    #handleUnsupportedOverwrite (err: Error, requestId: string) {
+        if (!err.message.includes('unsupported operation')) {
+            return this.#handleNetworkProvideResponseError(err)
+        }
+        log.warn(
+            `mock.respond() could not replace the response of request ${requestId}: ${err.message}. ` +
+            'The page received the real response. Use `fetchResponse: false` to answer before the request is sent.'
+        )
+        return this.#browser.networkProvideResponse({ request: requestId }).catch(this.#handleNetworkProvideResponseError)
+    }
+
+    /**
+     * The error of a network command that answers a paused request. It runs in a network
+     * event listener: no caller waits for it, so it is logged, not thrown (a thrown error
+     * would be an unhandled rejection). A request that is gone needs no answer.
+     */
+    #handleNetworkProvideResponseError = (err: Error) => {
+        if (err.message.endsWith('no such request')) {
+            return
+        }
+        logBackgroundError(log, 'Failed to answer a paused request', err, this.#browser)
+    }
+
+    /**
+     * Read a cached binary overwrite as a Buffer in Node.js or Uint8Array in browsers.
+     */
+    getBinaryResponse(requestId: string): Uint8Array | null {
+        const body = this.#overwrittenResponseBodies.get(requestId)
+        if (body?.type !== 'base64') {
+            return null
+        }
+        if (/[^A-Za-z0-9+/=\s]/.test(body.value)) {
+            log.warn(`Invalid base64 data for request ${requestId}`)
+            return null
+        }
+        return decodeBase64(body.value)
+    }
+
+    #attachPostData<T extends local.NetworkBeforeRequestSentParameters | Response>(request: T): RequestWithPostData<T> {
+        const requestWithPostData = request as RequestWithPostData<T>
+        const postData = this.#requestPostData.get(request.request.request)
+        if (postData !== undefined) {
+            requestWithPostData.postData = postData
+        }
+        return requestWithPostData
+    }
+
+    async #populateRequestPostData<T extends local.NetworkBeforeRequestSentParameters | Response>(request: T): Promise<RequestWithPostData<T>> {
+        const requestWithPostData = this.#attachPostData(request)
+        if (
+            requestWithPostData.postData !== undefined ||
+            this.#browser.options.maxSpyCollectedBodySize === 0
+        ) {
+            return requestWithPostData
+        }
+
+        try {
+            const { bytes } = await this.#browser.networkGetData({
+                request: request.request.request,
+                dataType: 'request'
+            })
+
+            if (bytes) {
+                requestWithPostData.postData = bytes.value
+                this.#requestPostData.set(request.request.request, bytes.value)
+            }
+        } catch (err: unknown) {
+            log.debug(`Failed to get request body for ${request.request.request}: ${(err as Error).message}`)
+        }
+
+        return requestWithPostData
+    }
+
+    /**
+     * Simulate a responseStarted event for testing purposes
+     * @param request NetworkResponseCompletedParameters to simulate
+     */
+    public simulateResponseStarted(request: Response): void {
+        try {
+            this.#handleResponseStarted(request)
+        } catch (e) {
+            console.log('DEBUG: Error in simulateResponseStarted:', e)
+            throw e
+        }
+    }
+
+    public debugResponseBodies(): Map<string, remote.NetworkBytesValue> {
+        return this.#overwrittenResponseBodies
+    }
+
+    #getCall(requestId: string) {
+        for (let index = this.#calls.length - 1; index >= 0; index--) {
+            const call = this.#calls[index]
+            if (call.request.request === requestId) {
+                return call
+            }
+        }
+    }
+
+    #isRequestMatching<T extends local.NetworkBeforeRequestSentParameters | Response>(request: T) {
+        const matches = this.#pattern && this.#pattern.test(request.request.url)
+        return request.isBlocked && matches
+    }
+
+    #matchesPostDataFilter<T extends local.NetworkBeforeRequestSentParameters | Response>(request: RequestWithPostData<T>) {
+        if (!this.#filterOptions.postData) {
+            return true
+        }
+
+        return typeof this.#filterOptions.postData === 'function'
+            ? this.#filterOptions.postData(request.postData)
+            : request.postData === this.#filterOptions.postData
+    }
+
+    #matchesFilterOptions<T extends local.NetworkBeforeRequestSentParameters | Response>(
+        request: T,
+        { includePostData = true }: { includePostData?: boolean } = {}
+    ) {
+        let isRequestMatching = true
+
+        if (isRequestMatching && this.#filterOptions.method) {
+            isRequestMatching = typeof this.#filterOptions.method === 'function'
+                ? this.#filterOptions.method(request.request.method)
+                : this.#filterOptions.method.toLowerCase() === request.request.method.toLowerCase()
+        }
+
+        if (isRequestMatching && this.#filterOptions.requestHeaders) {
+            isRequestMatching = typeof this.#filterOptions.requestHeaders === 'function'
+                ? this.#filterOptions.requestHeaders(request.request.headers.reduce((acc, { name, value }) => {
+                    acc[name] = decodeHeader(value)
+                    return acc
+                }, {} as Record<string, string>))
+                : Object.entries(this.#filterOptions.requestHeaders).every(([key, value]) => {
+                    const header = request.request.headers.find(({ name }) => name === key)
+                    if (!header) {
+                        return false
+                    }
+
+                    return decodeHeader(header.value) === value
+                })
+        }
+
+        if (isRequestMatching && includePostData) {
+            isRequestMatching = this.#matchesPostDataFilter(request as RequestWithPostData<T>)
+        }
+
+        if (isRequestMatching && this.#filterOptions.responseHeaders && 'response' in request) {
+            isRequestMatching = typeof this.#filterOptions.responseHeaders === 'function'
+                ? this.#filterOptions.responseHeaders(request.response.headers.reduce((acc, { name, value }) => {
+                    acc[name] = decodeHeader(value)
+                    return acc
+                }, {} as Record<string, string>))
+                : Object.entries(this.#filterOptions.responseHeaders).every(([key, value]) => {
+                    const header = request.response.headers.find(({ name }) => name === key)
+                    if (!header) {
+                        return false
+                    }
+
+                    return decodeHeader(header.value) === value
+                })
+        }
+
+        if (isRequestMatching && this.#filterOptions.statusCode && 'response' in request) {
+            isRequestMatching = typeof this.#filterOptions.statusCode === 'function'
+                ? this.#filterOptions.statusCode(request.response.status)
+                : this.#filterOptions.statusCode === request.response.status
+        }
+
+        return isRequestMatching
+    }
+
+    #setOverwrite = (overwriteProp: Overwrite[], { overwrite, abort, once }: Overwrite) => {
+        return once
+            ? [
+                ...overwriteProp.filter(({ once }) => once),
+                { overwrite, abort, once }
+            ]
+            : [{ overwrite, abort }]
+    }
+
+    /**
+     * allows access to all requests made with given pattern
+     */
+    get calls(): Response[] {
+        return this.#calls
+    }
+
+    get hasAtLeastOneResponseReceived(): boolean {
+        const isResponseReceived = this.calls && this.calls.length > 0
+        return isResponseReceived && (!this.#isCollectingNetworkData || this.#hasOneResponseCollected)
+    }
+
+    /**
+     * Resets all information stored in the `mock.calls` set.
+     */
+    clear() {
+        this.#calls = []
+        this.#overwrittenResponseBodies.clear()
+        this.#requestPostData.clear()
+        this.#hasOneResponseCollected = false
+        this.#hasOneBodyReadStarted = false
+        this.#blockedRequests.clear()
+        this.#requestsRespondedWithoutFetch.clear()
+        return this
+    }
+
+    /**
+     * Does what `mock.clear()` does and makes removes custom request overrides
+     * and response overwrites
+     */
+    reset() {
+        this.clear()
+        this.#respondOverwrites = []
+        this.#requestOverwrites = []
+        return this
+    }
+
+    /**
+     * Does everything that `mock.reset()` does, and also
+     * removes any mocked return values or implementations.
+     * Restored mock does not emit events and could not mock responses
+     */
+    async restore() {
+        /**
+         * Snapshot before reset()/clear() — those clear `#blockedRequests`, and we
+         * still need to continue any in-flight blocked requests after cleanup.
+         */
+        const blockedRequestIds = Array.from(this.#blockedRequests)
+        if (this.#onContextDestroyed) {
+            this.#browser.off('browsingContext.contextDestroyed', this.#onContextDestroyed)
+            this.#onContextDestroyed = undefined
+        }
+        this.reset()
+        this.#respondOverwrites = []
+        const handle = this.#sessionKey ?? await this.#browser.getWindowHandle()
+
+        log.trace(`Restoring mock for ${handle}`)
+        SESSION_MOCKS[handle]?.delete(this as WebDriverInterception)
+
+        // Continue any in-flight blocked requests before removing the intercept
+        // to prevent them from hanging
+        for (const requestId of blockedRequestIds) {
+            try {
+                await this.#browser.networkContinueRequest({ request: requestId })
+            } catch (err) {
+                // Ignore errors - request may have already completed or timed out
+                log.trace(`Failed to continue in-flight request ${requestId} during restore:`, err)
+            }
+        }
+        this.#blockedRequests.clear()
+
+        // Remove the network intercept BEFORE setting #restored flag
+        // This prevents new requests from being blocked while we're cleaning up
+        if (this.#mockId) {
+            await this.#browser.networkRemoveIntercept({ intercept: this.#mockId })
+        }
+
+        // Now it's safe to mark as restored
+        this.#restored = true
+
+        return this
+    }
+
+    /**
+     * Always use request modification for the next request done by the browser.
+     * @param payload  payload to overwrite the request
+     * @param once     apply overwrite only once for the next request
+     * @returns        this instance to chain commands
+     */
+    request(overwrite: RequestWithOptions, once?: boolean) {
+        this.#ensureNotRestored()
+        this.#requestOverwrites = this.#setOverwrite(this.#requestOverwrites, { overwrite, once })
+        return this
+    }
+
+    /**
+     * alias for `mock.request(…, true)`
+     */
+    requestOnce(payload: RequestWithOptions) {
+        return this.request(payload, true)
+    }
+
+    /**
+     * Always respond with same overwrite
+     * @param {*}       payload  payload to overwrite the response
+     * @param {*}       params   additional respond parameters to overwrite
+     * @param {boolean} once     apply overwrite only once for the next request
+     * @returns                  this instance to chain commands
+     */
+    respond(payload: RespondBody, params: Omit<RespondWithOptions, 'body'> = {}, once?: boolean) {
+        this.#ensureNotRestored()
+        this.#assertCanSkipFetch(params)
+        const body = typeof payload === 'function'
+            ? (request: local.NetworkResponseCompletedParameters) => toNetworkBody(payload(request))
+            : toNetworkBody(payload)
+        const overwrite: RespondWithOptions = { body, ...params }
+        this.#respondOverwrites = this.#setOverwrite(this.#respondOverwrites, { overwrite, once })
+        return this
+    }
+
+    /**
+     * alias for `mock.respond(…, true)`
+     */
+    respondOnce(payload: RespondBody, params: Omit<RespondWithOptions, 'body'> = {}) {
+        return this.respond(payload, params, true)
+    }
+
+    /**
+     * Abort the request with an error code
+     * @param {string} errorReason  error code of the response
+     * @param {boolean} once        if request should be aborted only once for the next request
+     */
+    abort(once?: boolean) {
+        this.#ensureNotRestored()
+        this.#requestOverwrites = this.#setOverwrite(this.#requestOverwrites, { abort: true, once })
+        return this
+    }
+
+    /**
+     * alias for `mock.abort(true)`
+     */
+    abortOnce() {
+        return this.abort(true)
+    }
+
+    /**
+     * Redirect request to another URL
+     * @param {string} redirectUrl  URL to redirect to
+     * @param {boolean} sticky      if request should be redirected for all following requests
+     */
+    redirect(redirectUrl: string, once?: boolean) {
+        this.#ensureNotRestored()
+        const requestWith = { url: redirectUrl }
+        this.request(requestWith, once)
+        return this
+    }
+
+    /**
+     * alias for `mock.redirect(…, true)`
+     */
+    redirectOnce(redirectUrl: string) {
+        return this.redirect(redirectUrl, true)
+    }
+
+    on(event: 'request', callback: (request: local.NetworkBeforeRequestSentParameters) => void): WebDriverInterception
+    on(event: 'match', callback: (match: local.NetworkBeforeRequestSentParameters) => void): WebDriverInterception
+    on(event: 'continue', callback: (requestId: string) => void): WebDriverInterception
+    on(event: 'fail', callback: (requestId: string) => void): WebDriverInterception
+    on(event: 'overwrite', callback: (response: Response) => void): WebDriverInterception
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    on(event: string, callback: (...args: any[]) => void): WebDriverInterception {
+        this.#addEventHandler(event, callback)
+        return this
+    }
+
+    #ensureNotRestored() {
+        if (this.#restored) {
+            throw new Error('This can\'t be done on restored mock')
+        }
+    }
+
+    /**
+     * A status or response-header filter matches the backend response.
+     * `fetchResponse: false` never calls the backend, so the filter cannot
+     * be decided and must not be silently ignored or bypassed by fetching.
+     */
+    #assertCanSkipFetch(params: Omit<RespondWithOptions, 'body'>) {
+        if (params.fetchResponse !== false) {
+            return
+        }
+
+        const filtersOnResponse = this.#filterOptions.statusCode !== undefined ||
+            this.#filterOptions.responseHeaders !== undefined
+        if (!filtersOnResponse) {
+            return
+        }
+
+        throw new Error(
+            'fetchResponse: false cannot be used when the mock filters on statusCode or responseHeaders. ' +
+            'Those filters need the backend response, and this option does not call the backend.'
+        )
+    }
+
+    /**
+     * Keep the request id tracked until the BiDi call settles so restore()
+     * can still continue it if cleanup races an in-flight interception.
+     */
+    #withBlockedRequestTracking(requestId: string, networkCall: Promise<unknown>) {
+        this.#blockedRequests.add(requestId)
+        return Promise.resolve(networkCall).finally(() => {
+            this.#blockedRequests.delete(requestId)
+        })
+    }
+
+    isSameDefinition(url: string | URLPattern | globalThis.URLPattern, filterOptions: MockFilterOptions = {}) {
+        const pattern = parseUrlPattern(url)
+        return this.#patternId === getPatternId(pattern) && areFilterOptionsEqual(this.#filterOptions, filterOptions)
+    }
+
+    waitForResponse({
+        timeout = this.#browser.options.waitforTimeout,
+        interval = this.#browser.options.waitforInterval,
+        timeoutMsg,
+    }: WaitForOptions = {}) {
+        /*!
+         * ensure that timeout and interval are set properly
+         */
+        if (typeof timeout !== 'number') {
+            timeout = this.#browser.options.waitforTimeout as number
+        }
+
+        if (typeof interval !== 'number') {
+            interval = this.#browser.options.waitforInterval as number
+        }
+
+        const isResponseReceived = () => this.hasAtLeastOneResponseReceived
+        const timer = new Timer(interval, timeout, isResponseReceived, true)
+
+        return this.#browser.call(() => timer.catch((e) => {
+            if (e.message === 'timeout') {
+                /**
+                 * The response completed, but the browser did not return its body in time.
+                 * Firefox can leave `network.getData` unanswered for a response that it
+                 * revalidated with 304 Not Modified (https://bugzilla.mozilla.org/show_bug.cgi?id=2077785).
+                 * Continue without the body: it is still added to `calls` if it arrives later.
+                 * A response that started but did not complete (e.g. it failed) still times out.
+                 */
+                if (this.#hasOneBodyReadStarted) {
+                    log.warn(`waitForResponse: a response was received, but its body was not collected within ${timeout}ms, continuing without it`)
+                    return true
+                }
+                if (typeof timeoutMsg === 'string') {
+                    throw new Error(timeoutMsg)
+                }
+                throw new Error(`waitForResponse timed out after ${timeout}ms`)
+            }
+
+            throw new Error(`waitForResponse failed with the following reason: ${(e && e.message) || e}`)
+        }))
+    }
+}
+
+/**
+ * brand every mock, see `@wdio/utils` `kind.ts`
+ */
+setWdioKind(WebDriverInterception.prototype, 'mock')
+
+export function parseUrlPattern(url: string | URLPattern | globalThis.URLPattern): URLPattern {
+    /**
+     * return early if it's already a URLPattern
+     */
+    if (typeof url === 'object') {
+        return url as URLPattern
+    }
+
+    /**
+     * A URLPattern `*` already matches any characters, `/` included, so a
+     * glob like `**` + `/api` means the same as `*` + `/api`. Each extra `*`
+     * adds a group to the compiled regular expression, though, and testing
+     * it against a long URL that does not match (e.g. a `data:` URL) then
+     * backtracks for seconds to minutes, which blocks the process.
+     */
+    url = url.replace(/(?<!\\)\*{2,}/g, '*')
+
+    /**
+     * parse URLPattern from absolute URL
+     */
+    if (url.startsWith('http')) {
+        return new URLPattern(url)
+    }
+
+    /**
+     * parse URLPattern from relative URL
+     */
+    return new URLPattern({
+        pathname: url
+    })
+}
+
+function getPatternId(pattern: URLPattern) {
+    return `${pattern.protocol}|${pattern.username}|${pattern.password}|${pattern.hostname}|${pattern.port}|${pattern.pathname}|${pattern.search}|${pattern.hash}`
+}
+
+function areFilterOptionsEqual(a: MockFilterOptions = {}, b: MockFilterOptions = {}) {
+    const keys: (keyof MockFilterOptions)[] = ['method', 'requestHeaders', 'responseHeaders', 'statusCode', 'postData']
+    return keys.every((key) => isFilterOptionValueEqual(a[key], b[key]))
+}
+
+function isFilterOptionValueEqual(a: unknown, b: unknown) {
+    if (a === b) {
+        return true
+    }
+
+    if (typeof a === 'function' || typeof b === 'function') {
+        return false
+    }
+
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+        const aKeys = Object.keys(a as Record<string, unknown>).sort()
+        const bKeys = Object.keys(b as Record<string, unknown>).sort()
+        if (aKeys.length !== bKeys.length) {
+            return false
+        }
+        return aKeys.every((k, i) => k === bKeys[i] && (a as Record<string, unknown>)[k] === (b as Record<string, unknown>)[k])
+    }
+
+    return false
+}

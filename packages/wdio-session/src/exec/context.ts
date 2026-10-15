@@ -1,0 +1,239 @@
+import path from 'node:path'
+import url from 'node:url'
+import vm from 'node:vm'
+import util from 'node:util'
+import module from 'node:module'
+
+import { installCommand, resolveOptionalDependency } from '@wdio/utils/node'
+
+import type * as ExpectWebdriverio from 'expect-webdriverio'
+import { SessionError } from '../errors.js'
+import { IMPORT_FN } from './transform.js'
+import type { Session } from '../session.js'
+import { scopeOf } from '../snapshot/target.js'
+
+export type ConsoleSink = (line: string) => void
+
+export interface ExecContext {
+    context: vm.Context
+    /**
+     * route `console` output of the running call
+     */
+    setSink: (sink: ConsoleSink) => void
+    /**
+     * base directory for relative imports of the running call
+     */
+    setBaseDir: (dir: string) => void
+    /**
+     * refs resolved by the running call, reset per call
+     */
+    usedRefs: Map<string, WebdriverIO.Element>
+}
+
+const CONTEXT_KEY = 'exec:context'
+const EXPECT_PACKAGE = 'expect-webdriverio'
+
+/** the ref a selector names, if it is one: `e12`, `[ref=e12]`, `[ref="e12"]` */
+export function refSelector (selector: unknown): string | undefined {
+    if (typeof selector !== 'string') {
+        return undefined
+    }
+    return /^\s*(?:\[ref=["']?(e\d+)["']?\]|(e\d+))\s*$/.exec(selector)?.slice(1).find(Boolean)
+}
+
+/**
+ * `ref('e3')` returns a thenable that also forwards element commands, so
+ * both `await ref('e3')` and `await ref('e3').click()` work.
+ */
+function chainable (promise: Promise<WebdriverIO.Element>) {
+    return new Proxy(promise, {
+        get (target, prop) {
+            if (prop === 'then' || prop === 'catch' || prop === 'finally') {
+                return (target[prop] as (...args: unknown[]) => unknown).bind(target)
+            }
+            return (...args: unknown[]) => target.then((el) => {
+                const fn = (el as unknown as Record<string | symbol, unknown>)[prop]
+                if (typeof fn !== 'function') {
+                    throw new TypeError(`ref(...).${String(prop)} is not a function`)
+                }
+                return (fn as (...a: unknown[]) => unknown).apply(el, args)
+            })
+        }
+    })
+}
+
+async function importFrom (baseDir: string, specifier: string) {
+    if (specifier.startsWith('node:') || module.isBuiltin(specifier)) {
+        return import(specifier)
+    }
+    if (specifier.startsWith('.') || path.isAbsolute(specifier)) {
+        return import(url.pathToFileURL(path.resolve(baseDir, specifier)).href)
+    }
+    if (specifier.startsWith('file:')) {
+        return import(specifier)
+    }
+    const resolved = await resolveOptionalDependency(specifier, { cwd: baseDir, from: import.meta.url })
+    if (!resolved) {
+        throw new Error(`Cannot find package '${specifier}' from ${baseDir}`)
+    }
+    return import(url.pathToFileURL(resolved).href)
+}
+
+/**
+ * The context `exec` code runs in (RFC §7.3). Created once per session so
+ * variables persist across calls.
+ */
+export async function getExecContext (session: Session): Promise<ExecContext> {
+    const existing = session.get<ExecContext>(CONTEXT_KEY)
+    if (existing) {
+        return existing
+    }
+    const waitforTimeout = (session.browser.options as { waitforTimeout?: number }).waitforTimeout
+    const expectEntry = await resolveOptionalDependency(EXPECT_PACKAGE, { cwd: session.cwd, from: import.meta.url })
+    /**
+     * some matchers read the global browser object
+     */
+    const g = globalThis as Record<string, unknown>
+    g.browser ??= session.browser
+    g.driver ??= session.browser
+
+    let sink: ConsoleSink = () => {}
+    let baseDir = session.cwd
+    const usedRefs = new Map<string, WebdriverIO.Element>()
+    const write = (prefix: string) => (...args: unknown[]) => {
+        const text = util.formatWithOptions({ colors: false, depth: 4 }, ...args)
+        for (const line of text.split('\n')) {
+            sink(prefix + line)
+        }
+    }
+    const capturedConsole = {
+        log: write(''),
+        info: write(''),
+        debug: write(''),
+        trace: write(''),
+        dir: (obj: unknown) => write('')(util.inspect(obj, { depth: 4 })),
+        table: (data: unknown) => write('')(util.inspect(data, { depth: 4 })),
+        warn: write('warn: '),
+        error: write('error: ')
+    }
+    const ref = (id: string) => chainable((async () => {
+        const el = await session.refs.resolve(scopeOf(session), String(id))
+        usedRefs.set(String(id), el)
+        return el
+    })())
+    /**
+     * `$$('e12')`: a list of the one element, used like other `$$` results:
+     * awaited, indexed (`$$('e12')[0].click()`) or with array methods.
+     */
+    const chainableList = (id: string) => {
+        const list = ref(id).then((el) => [el])
+        return new Proxy(list, {
+            get (target, prop) {
+                if (prop === 'then' || prop === 'catch' || prop === 'finally') {
+                    return (target[prop] as (...a: unknown[]) => unknown).bind(target)
+                }
+                if (prop === '0') {
+                    return ref(id)
+                }
+                if (prop === 'length') {
+                    return target.then((els) => els.length)
+                }
+                // `for await (const el of $$('e12'))`, as with other `$$` results
+                if (prop === Symbol.asyncIterator) {
+                    return async function * () {
+                        yield * await target
+                    }
+                }
+                return (...a: unknown[]) => target.then((els) => {
+                    const fn = (els as unknown as Record<string | symbol, unknown>)[prop]
+                    if (typeof fn !== 'function') {
+                        throw new TypeError(`$$(...).${String(prop)} is not a function`)
+                    }
+                    return (fn as (...b: unknown[]) => unknown).apply(els, a)
+                })
+            }
+        })
+    }
+
+    const globals: Record<string, unknown> = {
+        browser: session.browser,
+        driver: session.browser,
+        // a ref from the snapshot works as a selector too: `$('e12')`, `$('[ref=e12]')`
+        $: (...args: Parameters<WebdriverIO.Browser['$']>) => {
+            const id = refSelector(args[0])
+            return id ? ref(id) : session.browser.$(...args)
+        },
+        $$: (...args: Parameters<WebdriverIO.Browser['$$']>) => {
+            const id = refSelector(args[0])
+            return id ? chainableList(id) : session.browser.$$(...args)
+        },
+        ref,
+        session: {
+            name: session.name,
+            artifactsDir: session.artifactsDir,
+            log: write(''),
+            snapshot: async (opts: Record<string, unknown> = {}) => {
+                const result = await session.dispatch({ action: 'snapshot', args: { ...opts, maxChars: Number.MAX_SAFE_INTEGER, $internal: true }, cwd: session.cwd })
+                return (result.data as { snapshot?: string })?.snapshot ?? result.text
+            }
+        },
+        console: capturedConsole,
+        [IMPORT_FN]: (specifier: string) => importFrom(baseDir, specifier),
+        process,
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval,
+        setImmediate,
+        clearImmediate,
+        queueMicrotask,
+        structuredClone,
+        fetch,
+        Headers,
+        Request,
+        Response,
+        FormData,
+        URL,
+        URLSearchParams,
+        Buffer,
+        TextEncoder,
+        TextDecoder,
+        AbortController,
+        AbortSignal,
+        atob,
+        btoa,
+        performance,
+        crypto: globalThis.crypto
+    }
+    // expect-webdriverio is an optional peer: loaded on first use of `expect`, not at startup.
+    // A Proxy rather than a getter: errors thrown by a global's getter are swallowed by the vm context.
+    let loaded: typeof ExpectWebdriverio | undefined
+    const load = () => {
+        if (!loaded) {
+            if (!expectEntry) {
+                throw new SessionError('MISSING_DEPENDENCY', `Cannot use expect in exec: ${EXPECT_PACKAGE} is not installed.`, {
+                    package: EXPECT_PACKAGE,
+                    install: [installCommand(EXPECT_PACKAGE, { cwd: session.cwd })]
+                })
+            }
+            loaded = module.createRequire(import.meta.url)(expectEntry) as typeof ExpectWebdriverio
+            if (waitforTimeout) {
+                loaded.setDefaultOptions({ wait: waitforTimeout })
+            }
+        }
+        return loaded.expect
+    }
+    globals.expect = new Proxy(function expect () {}, {
+        apply: (_target, thisArg, args) => Reflect.apply(load(), thisArg, args),
+        get: (_target, prop) => Reflect.get(load(), prop)
+    })
+    const context = vm.createContext(globals, { name: `wdio session ${session.name}` })
+    const ctx: ExecContext = {
+        context,
+        setSink: (fn) => (sink = fn),
+        setBaseDir: (dir) => (baseDir = dir),
+        usedRefs
+    }
+    session.set(CONTEXT_KEY, ctx)
+    return ctx
+}

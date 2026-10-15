@@ -1,0 +1,94 @@
+/**
+ * sponsor section on the start site
+ */
+.sponsors h2 {
+    margin-bottom: 1rem;
+    font-size: clamp(1.9rem, 3.2vw, 2.7rem);
+    font-weight: 700;
+    letter-spacing: -0.035em;
+}
+
+.sponsors > p {
+    max-width: 44rem;
+    color: var(--wdio-text-muted);
+}
+
+.sponsors h3 {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 1.25rem;
+    color: var(--wdio-text-muted);
+    font-family: var(--ifm-font-family-monospace);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-align: left !important;
+    text-transform: uppercase;
+}
+
+.tierIcon {
+    flex: 0 0 auto;
+}
+
+.tierIcon--premium {
+    color: #7eb6ff;
+}
+
+.tierIcon--gold {
+    color: #e2b340;
+}
+
+.tierIcon--silver {
+    color: #b7bdc8;
+}
+
+.tierIcon--bronze {
+    color: #c4844a;
+}
+
+.tierIcon--backer {
+    color: #e07a7a;
+}
+
+.tierIcon--individual,
+.tierIcon--past {
+    color: var(--wdio-text-muted);
+}
+
+.markdown .tierIcon {
+    display: inline-block;
+    margin-left: 0.35rem;
+    vertical-align: -3px;
+}
+
+.markdown li .tierIcon {
+    margin-left: 0;
+    margin-right: 0.35rem;
+}
+
+.sponsors .sponsors-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+    margin: 2.5rem 0;
+}
+
+.sponsors .sponsors-grid > div {
+    padding: 1.5rem;
+    border: 1px solid var(--wdio-border);
+    border-radius: var(--wdio-radius);
+}
+
+.sponsors .logos {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 30px;
+}
+
+@media (max-width: 996px) {
+    .sponsors .sponsors-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

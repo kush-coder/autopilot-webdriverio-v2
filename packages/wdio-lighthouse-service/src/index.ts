@@ -1,0 +1,155 @@
+import type { Capabilities, Services, FunctionProperties, ThenArg } from '@wdio/types'
+import type { Browser as PuppeteerBrowser } from 'puppeteer-core'
+
+import CommandHandler from './commands.js'
+import type Auditor from './auditor.js'
+import { getAuditablePuppeteerPage, setUnsupportedCommand } from './utils.js'
+import { DEFAULT_THROTTLE_STATE, NETWORK_STATES } from './constants.js'
+import type { DevtoolsConfig, EnablePerformanceAuditsOptions, PWAAudits } from './types.js'
+
+export default class DevToolsService implements Services.ServiceInstance {
+    private _command: CommandHandler[] = []
+    private _browser?: WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser
+
+    constructor (private _options: DevtoolsConfig) {}
+
+    async before (
+        caps: Capabilities.RequestedStandaloneCapabilities | Capabilities.RequestedMultiRemoteCapabilities,
+        specs: string[],
+        browser: WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser
+    ) {
+        this._browser = browser
+        return await this._setupHandler()
+    }
+
+    async onReload () {
+        if (!this._browser) {
+            return
+        }
+
+        return this._setupHandler()
+    }
+
+    async beforeCommand (commandName: string, params: unknown[]) {
+        return Promise.all(this._command.map(async c => await c._beforeCmd(commandName, params)))
+    }
+
+    async afterCommand (commandName: string) {
+        if (commandName === 'switchToWindow') {
+            await this._setupHandler()
+        }
+
+        return Promise.all(this._command.map(async c => await c._afterCmd(commandName)))
+    }
+
+    /**
+     * set flag to run performance audits for page transitions
+     */
+    _enablePerformanceAudits ({ networkThrottling, cpuThrottling, cacheEnabled, formFactor }: EnablePerformanceAuditsOptions = DEFAULT_THROTTLE_STATE) {
+        if (!NETWORK_STATES[networkThrottling]) {
+            throw new Error(`Network throttling profile "${networkThrottling}" is unknown, choose between ${Object.keys(NETWORK_STATES).join(', ')}`)
+        }
+
+        if (typeof cpuThrottling !== 'number') {
+            throw new Error(`CPU throttling rate needs to be typeof number but was "${typeof cpuThrottling}"`)
+        }
+
+        for (const c of this._command) {
+            c.enablePerformanceAudits({ networkThrottling, cpuThrottling, cacheEnabled, formFactor })
+        }
+    }
+
+    /**
+     * custom command to disable performance audits
+     */
+    _disablePerformanceAudits () {
+        for (const c of this._command) {
+            c.disablePerformanceAudits()
+        }
+    }
+
+    async _setThrottlingProfile(
+        networkThrottling = DEFAULT_THROTTLE_STATE.networkThrottling,
+        cpuThrottling: number = DEFAULT_THROTTLE_STATE.cpuThrottling,
+        cacheEnabled: boolean = DEFAULT_THROTTLE_STATE.cacheEnabled
+    ) {
+        for (const c of this._command) {
+            c.setThrottlingProfile(networkThrottling, cpuThrottling, cacheEnabled)
+        }
+    }
+
+    async _checkPWA (auditsToBeRun?: PWAAudits[]) {
+        if (this._command.length === 1) {
+            return await this._command[0].checkPWA(auditsToBeRun)
+        }
+        return Promise.all(this._command.map(async c => await c.checkPWA(auditsToBeRun)))
+    }
+
+    async _setupHandler () {
+        if (!this._browser) {
+            return
+        }
+
+        /**
+         * In case of switchToWindow, needs to not add more commands to the array
+         */
+        this._command.length = 0
+
+        /**
+         * To avoid if-else, gather all browser instances into an array
+         */
+        const browsers = Object.keys(this._browser).includes('sessionId') ?
+            [this._browser] :
+            (this._browser as WebdriverIO.MultiRemoteBrowser).instances.map(i => (this._browser as WebdriverIO.MultiRemoteBrowser).getInstance(i))
+
+        for (const browser of browsers) {
+            const puppeteer = await (browser as WebdriverIO.Browser).getPuppeteer().catch(() => undefined) as unknown as PuppeteerBrowser
+            if (!puppeteer) {
+                return setUnsupportedCommand(browser as WebdriverIO.Browser)
+            }
+
+            const url = await (browser as WebdriverIO.Browser).getUrl()
+            const page = await getAuditablePuppeteerPage(puppeteer, url)
+            if (!page) {
+                throw new Error('No page found')
+            }
+
+            const session = await page.target().createCDPSession()
+            const cmd = new CommandHandler(session, page, this._options, browser)
+            await cmd._initCommand()
+            this._command.push(cmd)
+        }
+
+        // Casting help targeting the non deprecated overload function */
+        const browser = this._browser as WebdriverIO.Browser
+        browser.addCommand('enablePerformanceAudits', this._enablePerformanceAudits.bind(this), {})
+        browser.addCommand('disablePerformanceAudits', this._disablePerformanceAudits.bind(this), {})
+        browser.addCommand('checkPWA', this._checkPWA.bind(this), {})
+    }
+}
+
+export * from './types.js'
+
+type CommandHandlerCommands = FunctionProperties<CommandHandler>
+type AuditorCommands = Omit<FunctionProperties<Auditor>, 'updateCommands'>
+
+/**
+ * ToDo(Christian): use key remapping with TS 4.1
+ * https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-1.html#key-remapping-in-mapped-types
+ */
+interface BrowserExtension extends CommandHandlerCommands, AuditorCommands {}
+
+export type BrowserExtensionSync = {
+    [K in keyof BrowserExtension]: (...args: Parameters<BrowserExtension[K]>) => ThenArg<ReturnType<BrowserExtension[K]>>
+}
+
+declare global {
+    namespace WebdriverIO {
+        interface ServiceOption extends DevtoolsConfig {}
+    }
+
+    namespace WebdriverIO {
+        interface Browser extends BrowserExtension { }
+        interface MultiRemoteBrowser extends BrowserExtension { }
+    }
+}

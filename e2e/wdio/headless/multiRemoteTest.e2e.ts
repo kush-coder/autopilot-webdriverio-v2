@@ -1,0 +1,598 @@
+import { multiRemoteBrowser, expect } from '@wdio/globals'
+import { Key, multiRemote } from 'webdriverio'
+
+let browserA: WebdriverIO.Browser
+let browserB: WebdriverIO.Browser
+
+describe('multi remote test', () => {
+    before(() => {
+        browserA = multiRemoteBrowser.getInstance('browserA')
+        browserB = multiRemoteBrowser.getInstance('browserB')
+    })
+
+    describe('chat test', () => {
+        it('should open chat application', async () => {
+            browserA = await multiRemoteBrowser.getInstance('browserA')
+            browserB = await multiRemoteBrowser.getInstance('browserB')
+            await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/chat.html')
+        })
+
+        it('should login the browser A', async () => {
+            const nameInput = await browserA.$('.usernameInput')
+            await nameInput.addValue('Browser A')
+            await browserA.keys(Key.Enter)
+            await expect(browserA.$('.inputMessage')).toHaveAttribute('placeHolder', 'Type here...')
+        })
+
+        it('should login the browser B', async () => {
+            const nameInput = await browserB.$('.usernameInput')
+            await nameInput.addValue('Browser B')
+            await browserB.keys(Key.Enter)
+            await expect(browserB.$('.inputMessage')).toHaveAttribute('placeHolder', 'Type here...')
+        })
+
+        it('can access shared store', async () => {
+            expect(await browser.sharedStore.get('foo')).toBe('bar')
+            expect(await browserA.sharedStore.get('foo')).toBe('bar')
+            expect(await browserB.sharedStore.get('foo')).toBe('bar')
+        })
+    })
+
+    it('can add a locator strategy', async () => {
+        multiRemoteBrowser.addLocatorStrategy('selectHeader', (selector: any) => document.querySelector(selector) as HTMLElement)
+
+        expect(multiRemoteBrowser.addLocatorStrategy).toBeDefined()
+    })
+
+    describe('Multi-remote instance', () => {
+        it('should have 3 browser titles', async () => {
+            await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+            const titles = await multiRemoteBrowser.getTitle()
+
+            expect(titles).toEqual([
+                'WebdriverJS Testpage',
+                'WebdriverJS Testpage',
+                'WebdriverJS Testpage'
+            ])
+            expect(await multiRemoteBrowser.$('header').$('h1').isExisting()).toEqual([true, true, true])
+            expect(await multiRemoteBrowser.$('header').$('h1').getText()).toEqual([
+                'WebdriverJS Testpage',
+                'WebdriverJS Testpage',
+                'WebdriverJS Testpage'
+            ])
+        })
+
+        describe('select', () => {
+            it('should be able to select one specific instance on multi-remote element', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const title = multiRemoteBrowser.$('header').$('h1')
+                const browserAHeader = title.select('browserA')
+
+                expect(await browserAHeader.instances).toEqual(['browserA'])
+                expect(await browserAHeader.isExisting()).toEqual([true])
+
+                const browserAText = await browserAHeader.getText()
+                expect(browserAText).toEqual(['WebdriverJS Testpage'])
+            })
+
+            it('should be able to select two specific instance on multi-remote element', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const title = multiRemoteBrowser.$('header').$('h1')
+                const browserAHeader = title.select('browserA', 'browserC')
+
+                expect(await browserAHeader.instances).toEqual(['browserA', 'browserC'])
+                expect(await browserAHeader.isExisting()).toEqual([true, true])
+
+                const browserAText = await browserAHeader.getText()
+                expect(browserAText).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+            })
+
+            it('should be able to select multiple instances with a non existing one', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const title = multiRemoteBrowser.$('header').$('h1')
+                const browserAHeader = title.select('browserA', 'browserC', 'non-existing')
+
+                expect(await browserAHeader.instances).toEqual(['browserA', 'browserC'])
+                expect(await browserAHeader.isExisting()).toEqual([true, true])
+
+                const browserAText = await browserAHeader.getText()
+                expect(browserAText).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+            })
+
+            it('should throws if no valid instances are selected', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const title = multiRemoteBrowser.$('header').$('h1')
+                // @ts-expect-error: rejects seems missing...
+                await expect(() => title.select('non-existing').instances).rejects.toThrow('None of the following requested instances are valid: non-existing')
+            })
+
+            it('should be able to select 1 instance on the multi-remote browser', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+                await browserB.url('about:blank')
+
+                // Select only browserA, so browserB's missing element shouldn't matter
+                const header = await multiRemoteBrowser.select('browserA').$('header')
+
+                expect(await header.instances).toEqual(['browserA'])
+                expect(await header.isExisting()).toEqual([true])
+            })
+
+            it('should be able to select 2 instances on the multi-remote browser', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+                await browserB.url('about:blank')
+
+                const header = await multiRemoteBrowser.select('browserA', 'browserB').$('header')
+
+                expect(await header.instances).toEqual(expect.arrayContaining(['browserA', 'browserB']))
+                expect(await header.isExisting()).toEqual([true, false])
+            })
+
+            it('should be able to select 2 instances on the multi-remote browser and a non-existing one', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+                await browserB.url('about:blank')
+
+                const header = await multiRemoteBrowser.select('browserA', 'browserB', 'non-existing').$('header')
+
+                expect(await header.instances).toEqual(expect.arrayContaining(['browserA', 'browserB']))
+                expect(await header.isExisting()).toEqual([true, false])
+            })
+
+            it('should throw when no valid instances are selected', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+                await browserB.url('about:blank')
+
+                // @ts-expect-error: rejects seems missing...
+                await expect(async () => multiRemoteBrowser.select('non-existing')).rejects.toThrow('None of the following requested instances are valid: non-existing')
+            })
+
+            it('should allow chaining select with 1 browser on element query', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const header = await multiRemoteBrowser.select('browserA').$('header').$('h1').getText()
+
+                expect(header).toEqual(['WebdriverJS Testpage'])
+            })
+
+            it('should allow chaining select with 2 browser on element query', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                const header = await multiRemoteBrowser.select('browserA', 'browserC').$('header').$('h1').getText()
+
+                expect(header).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+            })
+
+            it('should keep instance scope when using select on a chained $ from an element', async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+                expect(await browserA.$('header').$('h1').getText()).toEqual('WebdriverJS Testpage')
+
+                // On browser, using select we do keep the selected instance scope, so we can chain $ and get the element from the selected browser
+                const browserChainedText = await multiRemoteBrowser.select('browserA').$('header').$('h1').getText()
+                expect(browserChainedText).toEqual(['WebdriverJS Testpage'])
+
+                // Selecting only for value it works!
+                const elementTextFromChainedSelected = await multiRemoteBrowser.$('header').$('h1').select('browserA').getText()
+                expect(elementTextFromChainedSelected).toEqual(['WebdriverJS Testpage'])
+
+                // However, should we do the same when selecting on a element and chaining $()?
+                const elementTextFromChainedParentSelected = await multiRemoteBrowser.$('header').select('browserA').$('h1').getText()
+                expect(elementTextFromChainedParentSelected).toEqual(['WebdriverJS Testpage'])
+            })
+
+            describe('Dynamically created multi-remote browser', () => {
+                let customMultiRemoteBrowser: WebdriverIO.MultiRemoteBrowser
+                before(async () => {
+                    customMultiRemoteBrowser = await multiRemote({
+                        browserA: {
+                            capabilities: {
+                                browserName: 'chrome',
+                                browserVersion: 'stable',
+                                'goog:chromeOptions': {
+                                    args: ['headless', 'disable-gpu']
+                                }
+                            } },
+                        browserB: {
+                            capabilities: {
+                                browserName: 'firefox',
+                                browserVersion: 'stable',
+                                'moz:firefoxOptions': {
+                                    args: ['-headless']
+                                }
+                            } }
+                    })
+                })
+
+                it('should be able to select 2 instances on the browser', async () => {
+                    const selected = await customMultiRemoteBrowser.select('browserA', 'browserB')
+
+                    expect(selected.instances).toEqual(['browserA', 'browserB'])
+                    expect(selected.getInstance('browserA')).toBeDefined()
+                    expect(selected.getInstance('browserB')).toBeDefined()
+                })
+
+                it('should be able to select 2 instances on the element', async () => {
+                    const selected = await customMultiRemoteBrowser.$('h1').select('browserA', 'browserB')
+
+                    expect(selected.instances).toEqual(['browserA', 'browserB'])
+                    expect(selected.getInstance('browserA')).toBeDefined()
+                    expect(selected.getInstance('browserB')).toBeDefined()
+                    expect(() => selected.getInstance('browserC')).toThrow('Multi-remote object has no instance named "browserC"')
+                })
+
+                it('should be able to chain select', async () => {
+                    const selected = await customMultiRemoteBrowser.$('h1').select('browserA', 'browserB').select('browserA')
+
+                    expect(selected.instances).toEqual(['browserA'])
+                    expect(selected.getInstance('browserA')).toBeDefined()
+                    expect(() => selected.getInstance('browserB')).toThrow('Multi-remote object has no instance named "browserB"')
+                })
+
+                it('should be able to select 2 instances on the element', async () => {
+                    const selected = await customMultiRemoteBrowser.$('h1')
+
+                    expect(selected.getInstance('browserA')).toBeDefined()
+                })
+
+            })
+
+            describe('should preserve custom commands, capabilities and more', () => {
+                before(async () => {
+                    await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+                    multiRemoteBrowser.addCommand(
+                        'customCommand',
+                        async function (this: WebdriverIO.Browser) {
+                            return this.getTitle()
+                        }
+                    )
+                    multiRemoteBrowser.addCommand(
+                        'customElementCommand',
+                        async function (this: WebdriverIO.Element) {
+                            return this.getText()
+                        },
+                        { attachToElement: true }
+                    )
+                })
+
+                it('should have custom commands on multiRemoteBrowser ', async () => {
+                    // @ts-expect-error custom element command is not part of the default type
+                    expect(await multiRemoteBrowser.customCommand()).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage', 'WebdriverJS Testpage'])
+                })
+
+                it('should have custom commands on queried element from original multiRemoteBrowser', async () => {
+                    const selectedElement = await multiRemoteBrowser.$('header h1')
+
+                    // @ts-expect-error custom element command is not part of the default type
+                    expect(await selectedElement.customElementCommand()).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage', 'WebdriverJS Testpage'])
+                })
+
+                it('should preserve custom commands when selecting browser', async () => {
+                    const selectedBrowser = multiRemoteBrowser.select('browserA', 'browserB')
+
+                    // @ts-expect-error custom element command is not part of the default type
+                    expect(await selectedBrowser.customCommand()).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+                })
+
+                it('preserve overridden commands on multiRemoteBrowser', async () => {
+                    multiRemoteBrowser.overwriteCommand('getCookies', async function (_originalCommand) {
+                        return 'getCookies (overwritten)'
+                    })
+
+                    expect(await multiRemoteBrowser.getCookies()).toBe('getCookies (overwritten)')
+                    expect(await multiRemoteBrowser.select('browserA', 'browserB').getCookies()).toBe('getCookies (overwritten)')
+                })
+
+                it('preserve overridden elements commands on multiRemoteBrowser', async () => {
+                    multiRemoteBrowser.overwriteCommand('getValue', async function (_originalCommand) {
+                        return 'getValue (overwritten)'
+                    }, { attachToElement: true })
+
+                    expect(await multiRemoteBrowser.$('header').$('h1').getValue()).toEqual(['getValue (overwritten)', 'getValue (overwritten)', 'getValue (overwritten)'])
+                    expect(await multiRemoteBrowser.select('browserA', 'browserB').$('header').$('h1').getValue()).toEqual(['getValue (overwritten)', 'getValue (overwritten)'])
+                    expect(await multiRemoteBrowser.$('header').$('h1').select('browserA', 'browserB').getValue()).toEqual(['getValue (overwritten)', 'getValue (overwritten)'])
+                })
+
+                it('should preserve custom commands when selecting element', async () => {
+
+                    const selectedHeaderOnBrowser = await multiRemoteBrowser.select('browserA', 'browserB').$('header').$('h1')
+                    const selectedHeaderOnElement = await multiRemoteBrowser.$('header').$('h1').select('browserA', 'browserB')
+
+                    // @ts-expect-error custom element command is not part of the default type
+                    expect(await selectedHeaderOnBrowser.customElementCommand()).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+                    // @ts-expect-error custom element command is not part of the default type
+                    expect(await selectedHeaderOnElement.customElementCommand()).toEqual(['WebdriverJS Testpage', 'WebdriverJS Testpage'])
+                })
+
+                it('should preserved addLocatorStrategy', async () => {
+                    multiRemoteBrowser.addLocatorStrategy('staticStrategy', (_selector: any) => ({ elementId: 'static' }) as unknown as HTMLElement)
+                    const selected = multiRemoteBrowser.select('browserA')
+
+                    expect(multiRemoteBrowser.addLocatorStrategy).toBeDefined()
+                    expect(selected.addLocatorStrategy).toBeDefined()
+                })
+
+                it('should preserve non-command properties when selecting a browser', async () => {
+
+                    const selected = multiRemoteBrowser.select('browserA', 'browserB')
+
+                    expect(browserA.strategies).toBeInstanceOf(Map)
+                    expect(browserA.isMobile).toBe(false)
+                    expect(browserA.isIOS).toBe(false)
+                    expect(browserA.isAndroid).toBe(false)
+                    expect(browserA.isFirefox).toBe(false)
+                    expect(browserA.isSauce).toBe(false)
+                    expect(browserA.isSeleniumStandalone).toBe(false)
+                    expect(browserA.isBidi).toBe(true)
+                    expect(browserA.isChromium).toBe(true)
+                    expect(browserA.isWindowsApp).toBe(false)
+                    expect(browserA.isMacApp).toBe(false)
+                    expect(browserA.puppeteer).toBeDefined()
+                    expect(browserA.isNativeContext).toBe(false)
+                    expect(browserA.mobileContext).toBe(undefined)
+                    expect(browserA.isMultiRemote).toBe(undefined)
+
+                    expect(multiRemoteBrowser.strategies).toBeInstanceOf(Map)
+                    expect(multiRemoteBrowser.isMobile).toBe(false)
+                    expect(multiRemoteBrowser.isIOS).toBe(false)
+                    expect(multiRemoteBrowser.isAndroid).toBe(false)
+                    expect(multiRemoteBrowser.isFirefox).toBe(false)
+                    expect(multiRemoteBrowser.isSauce).toBe(false)
+                    expect(multiRemoteBrowser.isSeleniumStandalone).toBe(false)
+                    expect(multiRemoteBrowser.isBidi).toBe(false)
+                    expect(multiRemoteBrowser.isChromium).toBe(false)
+                    expect(multiRemoteBrowser.isWindowsApp).toBe(false)
+                    expect(multiRemoteBrowser.isMacApp).toBe(false)
+                    expect(multiRemoteBrowser.puppeteer).toBeDefined()
+                    expect(multiRemoteBrowser.isNativeContext).toBe(false)
+                    expect(multiRemoteBrowser.mobileContext).toBe(undefined)
+                    expect(multiRemoteBrowser.isMultiRemote).toBe(true)
+
+                    expect(selected.strategies).toEqual(multiRemoteBrowser.strategies)
+                    expect(selected.isMobile).toBe(multiRemoteBrowser.isMobile)
+                    expect(selected.isIOS).toBe(multiRemoteBrowser.isIOS)
+                    expect(selected.isAndroid).toBe(multiRemoteBrowser.isAndroid)
+                    expect(selected.isFirefox).toBe(multiRemoteBrowser.isFirefox)
+                    expect(selected.isSauce).toBe(multiRemoteBrowser.isSauce)
+                    expect(selected.isSeleniumStandalone).toBe(multiRemoteBrowser.isSeleniumStandalone)
+                    expect(selected.isBidi).toBe(multiRemoteBrowser.isBidi)
+                    expect(selected.isChromium).toBe(multiRemoteBrowser.isChromium)
+                    expect(selected.isWindowsApp).toBe(multiRemoteBrowser.isWindowsApp)
+                    expect(selected.isMacApp).toBe(multiRemoteBrowser.isMacApp)
+                    expect(selected.puppeteer).toBe(multiRemoteBrowser.puppeteer)
+                    expect(selected.isNativeContext).toBe(multiRemoteBrowser.isNativeContext)
+                    expect(selected.mobileContext).toBe(multiRemoteBrowser.mobileContext)
+                    expect(selected.isMultiRemote).toBe(multiRemoteBrowser.isMultiRemote)
+                })
+            })
+        })
+
+        it('should always have selector for MultiRemoteElement[] when some browsers have no matching elements', async () => {
+
+            await multiRemoteBrowser.getInstance('browserA').url('about:blank')
+            await multiRemoteBrowser.getInstance('browserB').url('about:blank')
+            await multiRemoteBrowser.getInstance('browserC').url('https://guinea-pig.webdriver.io/')
+
+            const elements = await multiRemoteBrowser.$$('h1')
+
+            expect(elements).toHaveLength(2)
+            expect(elements[0].selector).toBe('h1')
+            expect(elements[1].selector).toBe('h1')
+        })
+
+        it('should return a MultiRemoteElementArray at runtime', async () => {
+            await multiRemoteBrowser.getInstance('browserA').url('about:blank')
+            await multiRemoteBrowser.getInstance('browserB').url('about:blank')
+            await multiRemoteBrowser.getInstance('browserC').url('about:blank')
+
+            const elements = await multiRemoteBrowser.$$('h1')
+
+            expect(elements).toHaveLength(0)
+            expect(elements).toHaveProperty('selector')
+            expect(elements.selector).toBe('h1')
+            expect(elements.foundWith).toBe('$$')
+            expect(elements.parent).toBeDefined()
+            expect(elements.getElements).toBeDefined()
+            expect(elements.isMultiRemote).toBe(true)
+            expect(Array.isArray(elements)).toBe(true)
+        })
+
+        it('should be able to query isDisplayed on element no longer existing', async () => {
+            await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/')
+
+            const h1 = multiRemoteBrowser.$('header h1')
+            const browserAH1 = multiRemoteBrowser.getInstance('browserA').$('header h1')
+            const browserBH1 = multiRemoteBrowser.getInstance('browserB').$('header h1')
+            const browserCH1 = multiRemoteBrowser.getInstance('browserC').$('header h1')
+            await multiRemoteBrowser.getInstance('browserA').url('about:blank')
+
+            expect(await browserAH1.isDisplayed()).toBe(false)
+            expect(await browserBH1.isDisplayed()).toBe(true)
+            expect(await browserCH1.isDisplayed()).toBe(true)
+            expect(await h1.isDisplayed()).toEqual(expect.arrayContaining([false, true, true]))
+        })
+    })
+
+    describe('element queries other than $ and $$', () => {
+        const forEachInstance = <T>(value: T) => multiRemoteBrowser.instances.map(() => value)
+
+        before(async () => {
+            await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/shadowDom.html')
+            multiRemoteBrowser.addLocatorStrategy('allByCss', (selector: string) => Array.from(document.querySelectorAll(selector)) as HTMLElement[])
+        })
+
+        it('custom$ gives one multi-remote element', async () => {
+            const heading = await multiRemoteBrowser.custom$('allByCss', 'h1')
+
+            expect(heading.isMultiRemote).toBe(true)
+            expect(heading.instances).toEqual(multiRemoteBrowser.instances)
+            expect(await heading.getText()).toEqual(forEachInstance('Simple template'))
+        })
+
+        it('custom$$ gives one multi-remote list', async () => {
+            const items = await multiRemoteBrowser.custom$$('allByCss', 'ul[slot="my-text"] li')
+
+            expect(items.isMultiRemote).toBe(true)
+            expect(items.foundWith).toBe('custom$$')
+            expect(items.props).toEqual(['ul[slot="my-text"] li'])
+            await expect(items).toBeElementsArrayOfSize(2)
+            expect(await items[1].getText()).toEqual(forEachInstance('In a list!'))
+            expect(await items[1].getInstance('browserB').getText()).toBe('In a list!')
+        })
+
+        it('shadow$ and shadow$$ give multi-remote objects', async () => {
+            const host = await multiRemoteBrowser.$$('my-paragraph')[1]
+            const paragraph = await host.shadow$('p')
+            const slots = await host.shadow$$('slot')
+
+            expect(paragraph.isMultiRemote).toBe(true)
+            expect(await paragraph.getTagName()).toEqual(forEachInstance('p'))
+            expect(slots.isMultiRemote).toBe(true)
+            expect(slots.foundWith).toBe('shadow$$')
+            await expect(slots).toBeElementsArrayOfSize(1)
+        })
+
+        it('shadow$ chained on $ gives one multi-remote element', async () => {
+            const paragraph = await multiRemoteBrowser.$('my-paragraph:last-of-type').shadow$('p')
+
+            expect(paragraph.isMultiRemote).toBe(true)
+            expect(await paragraph.getTagName()).toEqual(forEachInstance('p'))
+        })
+
+        it('nextElement, previousElement and parentElement give one multi-remote element', async () => {
+            const first = await multiRemoteBrowser.$('ul[slot="my-text"] li:first-child')
+
+            const next = await first.nextElement()
+            const previous = await next.previousElement()
+            const parent = await first.parentElement()
+
+            expect(next.isMultiRemote).toBe(true)
+            expect(await next.getText()).toEqual(forEachInstance('In a list!'))
+            expect(await previous.getText()).toEqual(forEachInstance('Let\'s have some different text!'))
+            expect(await parent.getTagName()).toEqual(forEachInstance('ul'))
+        })
+
+        /**
+         * expect-webdriverio queries a list again with `parent[foundWith](selector, ...props)`,
+         * and an index past the end of a list runs the same query. Each case changes the page
+         * 500 ms after the first query.
+         */
+        describe('query a multi-remote list again', () => {
+            const ITEMS = 'ul[slot="my-text"] li'
+            const LATE_ITEMS = 'ul[slot="my-text"] li.late'
+            const itemsByFunction = () => Array.from(document.querySelectorAll('ul[slot="my-text"] li')) as HTMLElement[]
+            const lateItemsByFunction = () => Array.from(document.querySelectorAll('ul[slot="my-text"] li.late')) as HTMLElement[]
+
+            const addLateItems = (scope: WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser, count: number) => scope.execute((itemCount: number) => {
+                setTimeout(() => {
+                    for (let index = 1; index <= itemCount; index++) {
+                        const item = document.createElement('li')
+                        item.className = 'late'
+                        item.textContent = `late ${index}`
+                        document.querySelector('ul[slot="my-text"]')!.appendChild(item)
+                    }
+                }, 500)
+            }, count)
+            const removeItems = () => multiRemoteBrowser.execute(() => {
+                setTimeout(() => document.querySelector('ul[slot="my-text"]')!.replaceChildren(), 500)
+            })
+            const queryAgain = (list: WebdriverIO.MultiRemoteElementArray) => {
+                const parent = list.parent as unknown as Record<string, (...args: unknown[]) => WebdriverIO.MultiRemoteElementArray>
+                return parent[list.foundWith](list.selector, ...list.props)
+            }
+
+            beforeEach(async () => {
+                await multiRemoteBrowser.url('https://guinea-pig.webdriver.io/shadowDom.html')
+            })
+
+            const queries: [string, () => WebdriverIO.MultiRemoteElementArray, () => WebdriverIO.MultiRemoteElementArray][] = [
+                ['$$ with a string selector', () => multiRemoteBrowser.$$(ITEMS), () => multiRemoteBrowser.$$(LATE_ITEMS)],
+                ['$$ with a function selector', () => multiRemoteBrowser.$$(itemsByFunction), () => multiRemoteBrowser.$$(lateItemsByFunction)],
+                ['custom$$', () => multiRemoteBrowser.custom$$('allByCss', ITEMS), () => multiRemoteBrowser.custom$$('allByCss', LATE_ITEMS)]
+            ]
+            for (const [name, queryItems, queryLateItems] of queries) {
+                describe(name, () => {
+                    it('finds an element that appears later', async () => {
+                        const items = await queryItems()
+                        expect(items).toHaveLength(2)
+                        await addLateItems(multiRemoteBrowser, 1)
+
+                        await expect(items).toBeElementsArrayOfSize(3)
+                        const again = await queryAgain(items)
+                        expect(again.isMultiRemote).toBe(true)
+                        expect(again.foundWith).toBe(items.foundWith)
+                        expect(await again[2].getText()).toEqual(forEachInstance('late 1'))
+                    })
+
+                    it('finds the elements of a list that was empty', async () => {
+                        const items = await queryLateItems()
+                        expect(items).toHaveLength(0)
+                        expect(items.isMultiRemote).toBe(true)
+                        await addLateItems(multiRemoteBrowser, 2)
+
+                        /**
+                         * an index past the end waits and runs the query again
+                         */
+                        expect(await (await items[1]).getText()).toEqual(forEachInstance('late 2'))
+                        await expect(items).toBeElementsArrayOfSize(2)
+                        expect(await queryAgain(items)).toHaveLength(2)
+                    })
+
+                    it('gives an empty list when the elements disappear', async () => {
+                        const items = await queryItems()
+                        expect(items).toHaveLength(2)
+                        const first = items[0]
+                        await removeItems()
+
+                        await expect(items).toBeElementsArrayOfSize(0)
+                        const again = await queryAgain(items)
+                        expect(again.isMultiRemote).toBe(true)
+                        expect(again).toHaveLength(0)
+                        expect(await first.isExisting()).toEqual(forEachInstance(false))
+                    })
+
+                    it('finds an element that appears in one browser only', async () => {
+                        const items = await queryItems()
+                        expect(items).toHaveLength(2)
+                        await addLateItems(multiRemoteBrowser.getInstance('browserB'), 1)
+
+                        await expect(items).toBeElementsArrayOfSize(expect.multiRemote({ browserA: 2, browserB: 3, browserC: 2 }))
+                        await expect(items).toHaveText(expect.multiRemote({
+                            browserA: ['Let\'s have some different text!', 'In a list!'],
+                            browserB: ['Let\'s have some different text!', 'In a list!', 'late 1'],
+                            browserC: ['Let\'s have some different text!', 'In a list!']
+                        }))
+
+                        /**
+                         * the third entry exists only in browserB, the second instance: it keeps
+                         * the scope of that element and does not query the page of the browsers
+                         */
+                        const again = await queryAgain(items)
+                        expect(again).toHaveLength(3)
+                        expect(await again[2].select('browserB').getText()).toEqual(['late 1'])
+                        await expect(again[2].getText()).rejects.toThrow('Multi-remote object has no instance named "browserA"')
+                    })
+                })
+            }
+
+            it('shadow$$ finds an element that appears later', async () => {
+                const host = await multiRemoteBrowser.$$('my-paragraph')[1]
+                const slots = await host.shadow$$('slot')
+                expect(slots).toHaveLength(1)
+                await multiRemoteBrowser.execute(() => {
+                    setTimeout(() => {
+                        document.querySelectorAll('my-paragraph')[1].shadowRoot!.appendChild(document.createElement('slot'))
+                    }, 500)
+                })
+
+                await expect(slots).toBeElementsArrayOfSize(2)
+                const again = await queryAgain(slots)
+                expect(again.foundWith).toBe('shadow$$')
+                expect(again).toHaveLength(2)
+            })
+        })
+    })
+})

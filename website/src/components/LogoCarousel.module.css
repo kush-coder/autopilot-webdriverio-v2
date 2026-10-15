@@ -1,0 +1,87 @@
+.companyUsage {
+    width: 100%;
+}
+
+body .companyUsage h3 {
+    font-size: 1.1em;
+    font-weight: 900;
+}
+
+.logos {
+    overflow: hidden;
+}
+
+.logos ul {
+    display: flex;
+    width: max-content;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    transition: transform 700ms ease;
+}
+
+.logos ul li {
+    display: flex;
+    flex: 0 0 160px;
+    height: 72px;
+    justify-content: center;
+    align-items: center;
+}
+
+.logos ul img {
+    max-width: 112px;
+    max-height: 44px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+}
+
+.logos ul a {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 0;
+}
+
+.logoNavigation {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin-top: 1.5rem;
+    padding: 6px 0;
+    overflow: visible;
+}
+
+.button {
+    appearance: none;
+    display: block;
+    flex: 0 0 auto;
+    box-sizing: border-box;
+    width: 8px;
+    height: 8px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: var(--wdio-border-strong);
+    cursor: pointer;
+    line-height: 0;
+    transition: width 200ms ease, background 200ms ease;
+}
+
+.button:hover {
+    background: var(--wdio-text-muted);
+}
+
+.buttonActive,
+.buttonActive:hover {
+    width: 22px;
+    background: var(--ifm-color-primary);
+}
+
+.button:focus-visible {
+    outline: 2px solid var(--ifm-color-primary);
+    outline-offset: 3px;
+}

@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "outDir": "dist",
+    "noImplicitAny": true,
+    "strict": false,
+    "lib": ["es2024", "DOM"],
+    "module": "NodeNext",
+    "moduleResolution": "Node16",
+    "target": "ES2024",
+    "types": [
+      "node",
+      "webdriverio",
+      "@wdio/utils",
+      "@wdio/types",
+      "@wdio/globals/types",
+      "@wdio/allure-reporter",
+      "@wdio/appium-service",
+      "@wdio/lighthouse-service",
+      "@wdio/firefox-profile-service",
+      "@wdio/static-server-service",
+      "@wdio/testingbot-service",
+      "@wdio/sauce-service",
+      "@wdio/sumologic-reporter",
+      "@wdio/shared-store-service"
+    ]
+  },
+  "include": ["./*.ts"]
+}

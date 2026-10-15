@@ -1,0 +1,336 @@
+import { expect, describe, it, beforeAll, afterEach, vi } from 'vitest'
+
+import { remote } from '../../../src/index.js'
+
+vi.mock('fetch')
+
+describe('waitUntil', () => {
+    let browser: WebdriverIO.Browser
+
+    beforeAll(async () => {
+        browser = await remote({
+            baseUrl: 'http://foobar.com',
+            capabilities: {
+                browserName: 'foobar'
+            }
+        })
+    })
+
+    it('Should throw an error if an invalid condition is used', async () => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            // @ts-ignore test invalid condition parameter
+            val = await browser.waitUntil('foo', {
+                timeout: 500,
+                timeoutMsg: 'Timed Out',
+                interval: 200
+            })
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('Condition is not a function')
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it.each([false, '', 0])('Should throw an error when the waitUntil times out e.g. doesnt resolve to a truthy value: %i', async () => {
+        let error
+        let val
+        expect.assertions(2)
+        try {
+            val = await browser.waitUntil(
+                () => new Promise<boolean>(
+                    (resolve) => setTimeout(
+                        () => resolve(false),
+                        200
+                    )
+                ), {
+                    timeout: 500,
+                    timeoutMsg: 'Timed Out',
+                    interval: 200
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('Timed Out')
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('Should throw an error when the promise is rejected', async () => {
+        let error
+        let val
+        expect.assertions(3)
+        try {
+            val = await browser.waitUntil(
+                () => new Promise<boolean>(
+                    (_, reject) => setTimeout(
+                        () => reject(new Error('foobar')),
+                        200
+                    )
+                ), {
+                    timeout: 500,
+                    timeoutMsg: 'Timed Out',
+                    interval: 200
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('waitUntil condition failed with the following reason: foobar')
+            expect(error.stack).toMatch(/browser[\\/]waitUntil\.test\.ts:72/)
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('should throw an error if the condition throws', async () => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(3)
+        try {
+            val = await browser.waitUntil(
+                () => {
+                    throw new Error('foobar')
+                }, {
+                    timeout: 500,
+                    timeoutMsg: 'Timed Out',
+                    interval: 200
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('waitUntil condition failed with the following reason: foobar')
+            expect(error.stack).toMatch(/browser[\\/]waitUntil\.test\.ts:98/)
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('Should throw an error when the promise is rejected without error message', async () => {
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            val = await browser.waitUntil(
+                () => new Promise<boolean>(
+                    (resolve, reject) => setTimeout(
+                        () => reject(new Error()),
+                        200
+                    )
+                ), {
+                    timeout: 500
+                }
+            )
+        } catch (err: any) {
+            expect(err.message).toContain('waitUntil condition failed with the following reason: Error')
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('Should use default timeout setting from config if passed in value is not a number', {
+        timeout: 10_000
+    }, async () => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            // @ts-ignore test invalid timeout parameter
+            val = await browser.waitUntil(
+                () => new Promise<boolean>(
+                    (resolve) => setTimeout(
+                        () => resolve(false),
+                        500
+                    )
+                ), {
+                    // @ts-expect-error wrong parameter
+                    timeout: 'blah',
+                    interval: 200
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toMatch(/waitUntil condition timed out after \d+ms/)
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('Should use default interval setting from config if passed in value is not a number', async () => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            // @ts-ignore test invalid interval parameter
+            val = await browser.waitUntil(
+                () => new Promise<boolean>(
+                    (resolve) => setTimeout(
+                        () => resolve(false),
+                        500
+                    )
+                ), {
+                    timeout: 1000,
+                    timeoutMsg: 'Timed Out',
+                    // @ts-expect-error wrong parameter
+                    interval: 'blah'
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('Timed Out')
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it.each([true, 'false', 123])('Should pass for a truthy resolved value: %i', async(n) => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            val = await browser.waitUntil(
+                () => new Promise<any>(
+                    (resolve) => setTimeout(
+                        () => resolve(n),
+                        200
+                    )
+                ), {
+                    timeout: 500,
+                    timeoutMsg: 'Timed Out',
+                    interval: 200
+                }
+            )
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error).toBeUndefined()
+            expect(val).toBe(n)
+        }
+    })
+
+    it.each([false, '', 0])('Should throw a custom error message when the waitUntil always returns false: %i', async (n) => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            val = await browser.waitUntil(() => n, {
+                timeout: 500,
+                timeoutMsg: 'Custom error message',
+                interval: 200
+            })
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toContain('Custom error message')
+            expect(val).toBeUndefined()
+        }
+    })
+
+    it('should evaluate timeoutMsg callback only after the wait times out', async () => {
+        const timeoutMsg = vi.fn(() => 'deferred timeout message')
+        const waitPromise = browser.waitUntil(() => false, {
+            timeout: 200,
+            timeoutMsg,
+            interval: 50
+        })
+
+        expect(timeoutMsg).not.toHaveBeenCalled()
+        await expect(waitPromise).rejects.toThrow('deferred timeout message')
+        expect(timeoutMsg).toHaveBeenCalledTimes(1)
+    })
+
+    it.each([false, '', 0])('if no timeousMsg is given, Should throw a default error message when the waitUntil always returns false: %i', async (n) => {
+        let error
+        let val
+        // @ts-ignore uses expect-webdriverio
+        expect.assertions(2)
+        try {
+            val = await browser.waitUntil(() => n, {
+                timeout: 500,
+                interval: 200
+            })
+        } catch (err: any) {
+            error = err
+        } finally {
+            expect(error.message).toMatch(/waitUntil condition timed out after \d+ms/)
+            expect(val).toBeUndefined()
+        }
+    })
+
+    /**
+     * a code tells a timeout from a condition that failed, whatever the message (#16077)
+     */
+    describe('the code of a timeout', () => {
+        it.each([
+            ['the default message', undefined],
+            ['a custom message', 'Custom error message'],
+            ['a message function', () => 'deferred timeout message']
+        ])('is WAIT_UNTIL_TIMEOUT with %s', async (_, timeoutMsg) => {
+            const error = await browser.waitUntil(() => false, { timeout: 100, interval: 20, timeoutMsg })
+                .then(() => null, (err: Error) => err)
+            expect(error).toHaveProperty('code', 'WAIT_UNTIL_TIMEOUT')
+        })
+
+        /**
+         * only a timeout of the timer gets the code, not a condition that throws an error with
+         * the message "timeout" (#16077 review)
+         */
+        it('is not on the error of a condition that throws an error with the message "timeout"', async () => {
+            const error = await browser.waitUntil(() => { throw new Error('timeout') }, { timeout: 100, interval: 20, timeoutMsg: 'Custom error message' })
+                .then(() => null, (err: Error) => err)
+            expect(error?.message).toBe('waitUntil condition failed with the following reason: timeout')
+            expect(error).not.toHaveProperty('code')
+        })
+
+        /**
+         * a wait inside the condition times out: the outer wait fails as a condition, with the
+         * error of the inner wait (#16077)
+         */
+        it('is not taken from a wait inside the condition', async () => {
+            const error = await browser.waitUntil(
+                () => browser.waitUntil(() => false, { timeout: 20, interval: 10, timeoutMsg: 'inner wait' }),
+                { timeout: 100, interval: 20, timeoutMsg: 'outer wait' }
+            ).then(() => null, (err: Error) => err)
+            expect(error?.message).toBe('waitUntil condition failed with the following reason: inner wait')
+            expect(error).not.toHaveProperty('code')
+        })
+
+        it('is not on the error of a condition that failed', async () => {
+            const error = await browser.waitUntil(() => { throw new Error('foobar') }, { timeout: 100, interval: 20 })
+                .then(() => null, (err: Error) => err)
+            expect(error?.message).toContain('waitUntil condition failed with the following reason: foobar')
+            expect(error).not.toHaveProperty('code')
+        })
+    })
+
+    /**
+     * e.g. the "element wasn't found" error of an element that the page removed, with its code
+     * and its stale element cause (#16077 review)
+     */
+    describe('the error of a condition that failed', () => {
+        it('is the cause of the error of the wait', async () => {
+            const failure = Object.assign(new Error('foobar'), { code: 'ELEMENT_NOT_FOUND_AGAIN' })
+            const error = await browser.waitUntil(() => { throw failure }, { timeout: 100, interval: 20 })
+                .then(() => null, (err: Error) => err)
+            expect(error?.cause).toBe(failure)
+        })
+
+        it('is the cause also when it is not an error', async () => {
+            const error = await browser.waitUntil(() => Promise.reject('foobar'), { timeout: 100, interval: 20 })
+                .then(() => null, (err: Error) => err)
+            expect(error?.cause).toBe('foobar')
+        })
+    })
+
+    afterEach(() => {
+        vi.mocked(fetch).mockClear()
+    })
+})

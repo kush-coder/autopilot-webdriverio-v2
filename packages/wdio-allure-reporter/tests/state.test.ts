@@ -1,0 +1,194 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { describe, it, expect, beforeEach } from 'vitest'
+import { temporaryDirectory } from 'tempy'
+import { ReporterRuntime } from 'allure-js-commons/sdk/reporter'
+import { FileSystemWriter } from 'allure-js-commons/sdk/reporter'
+import { AllureReportState } from '../src/state.js'
+import { clean, getResultFiles, getResults } from './helpers/wdio-allure-helper.js'
+
+describe('state', () => {
+    const outputDir = temporaryDirectory()
+    let runtime: ReporterRuntime
+    let state: AllureReportState
+
+    beforeEach(() => {
+        clean(outputDir)
+
+        runtime = new ReporterRuntime({
+            writer: new FileSystemWriter({ resultsDir: outputDir })
+        })
+        state = new AllureReportState(runtime)
+    })
+
+    it('clears the pending test when the test ends', () => {
+        state.pushRuntimeMessage({ type: 'allure:suite:start', data: { name: 'test suite' } })
+        state.pushRuntimeMessage({ type: 'allure:test:start', data: { name: 'test case', start: Date.now() } })
+
+        expect(state.hasPendingTest).toBe(true)
+
+        state.pushRuntimeMessage({ type: 'allure:test:end', data: { status: 'passed' as any } })
+        state.pushRuntimeMessage({ type: 'allure:suite:end', data: {} })
+
+        expect(state.hasPendingTest).toBe(false)
+    })
+
+    describe('with suite', () => {
+        it('returns the latest feature suite', () => {
+            state.pushRuntimeMessage({ type: 'allure:suite:start', data: { name: 'first suite', feature: true } })
+            state.pushRuntimeMessage({ type: 'allure:suite:start', data: { name: 'second suite', feature: true } })
+
+            expect(state.currentFeature).toBe('second suite')
+        })
+    })
+
+    describe('with test', () => {
+        it('writes title path from test info', async () => {
+            state.pushRuntimeMessage({ type: 'allure:test:start', data: { name: 'test case', start: Date.now() } })
+            state.pushRuntimeMessage({
+                type: 'allure:test:info',
+                data: {
+                    fullName: 'foo/bar.test.js#test suite test case',
+                    titlePath: ['foo', 'bar.test.js', 'test suite']
+                }
+            })
+            state.pushRuntimeMessage({ type: 'allure:test:end', data: { status: 'passed' as any } })
+
+            await state.processRuntimeMessage()
+
+            const { results } = getResults(outputDir)
+            expect(results).toHaveLength(1)
+            expect(results[0].titlePath).toEqual(['foo', 'bar.test.js', 'test suite'])
+        })
+    })
+
+    describe('without test', () => {
+        it('returns undefined', () => {
+            expect(state.hasPendingTest).toBe(false)
+        })
+    })
+
+    describe('pending hook', () => {
+        it('is pending between hook start and hook end', () => {
+            state.pushRuntimeMessage({ type: 'allure:hook:start', data: { name: '"before each" hook', type: 'before', start: Date.now() } })
+            expect(state.hasPendingHook).toBe(true)
+            state.pushRuntimeMessage({ type: 'allure:hook:end', data: { status: 'passed', stop: Date.now() } as any })
+            expect(state.hasPendingHook).toBe(false)
+        })
+
+        it('is clear before any hook starts', () => {
+            expect(state.hasPendingHook).toBe(false)
+        })
+    })
+
+    describe('global errors', () => {
+        it('writes globals file when global_error is sent outside of any test', async () => {
+            state.pushRuntimeMessage({
+                type: 'global_error',
+                data: { message: 'something went wrong', trace: 'Error: something went wrong\n  at foo.ts:1' }
+            })
+            await state.processRuntimeMessage()
+
+            const globalsFiles = getResultFiles(outputDir, [/-globals\.json$/])
+            expect(globalsFiles).toHaveLength(1)
+
+            const content = JSON.parse(fs.readFileSync(path.join(outputDir, globalsFiles[0]), 'utf-8'))
+            expect(content.errors).toHaveLength(1)
+            expect(content.errors[0]).toMatchObject({
+                message: 'something went wrong',
+                trace: 'Error: something went wrong\n  at foo.ts:1'
+            })
+            expect(content.attachments).toHaveLength(0)
+        })
+
+        it('writes globals file when global_error is sent during an active test', async () => {
+            state.pushRuntimeMessage({ type: 'allure:suite:start', data: { name: 'suite' } })
+            state.pushRuntimeMessage({ type: 'allure:test:start', data: { name: 'test', start: Date.now() } })
+            state.pushRuntimeMessage({
+                type: 'global_error',
+                data: { message: 'global failure' }
+            })
+            state.pushRuntimeMessage({ type: 'allure:test:end', data: { status: 'passed' as any } })
+            state.pushRuntimeMessage({ type: 'allure:suite:end', data: {} })
+            await state.processRuntimeMessage()
+
+            const globalsFiles = getResultFiles(outputDir, [/-globals\.json$/])
+            expect(globalsFiles).toHaveLength(1)
+
+            const content = JSON.parse(fs.readFileSync(path.join(outputDir, globalsFiles[0]), 'utf-8'))
+            expect(content.errors[0]).toMatchObject({ message: 'global failure' })
+        })
+    })
+
+    describe('global attachments', () => {
+        it('writes globals file when global_attachment_content is sent outside of any test', async () => {
+            const content = Buffer.from('attachment body', 'utf8')
+            state.pushRuntimeMessage({
+                type: 'global_attachment_content',
+                data: {
+                    name: 'my attachment',
+                    content: content.toString('base64'),
+                    encoding: 'base64',
+                    contentType: 'text/plain',
+                }
+            })
+            await state.processRuntimeMessage()
+
+            const globalsFiles = getResultFiles(outputDir, [/-globals\.json$/])
+            expect(globalsFiles).toHaveLength(1)
+
+            const parsed = JSON.parse(fs.readFileSync(path.join(outputDir, globalsFiles[0]), 'utf-8'))
+            expect(parsed.attachments).toHaveLength(1)
+            expect(parsed.attachments[0]).toMatchObject({ name: 'my attachment', type: 'text/plain' })
+            expect(parsed.errors).toHaveLength(0)
+        })
+
+        it('writes globals file when global_attachment_path is sent outside of any test', async () => {
+            fs.mkdirSync(outputDir, { recursive: true })
+            const tmpFile = path.join(outputDir, 'fixture.txt')
+            fs.writeFileSync(tmpFile, 'file content', 'utf-8')
+
+            state.pushRuntimeMessage({
+                type: 'global_attachment_path',
+                data: {
+                    name: 'my file attachment',
+                    path: tmpFile,
+                    contentType: 'text/plain',
+                }
+            })
+            await state.processRuntimeMessage()
+
+            const globalsFiles = getResultFiles(outputDir, [/-globals\.json$/])
+            expect(globalsFiles).toHaveLength(1)
+
+            const parsed = JSON.parse(fs.readFileSync(path.join(outputDir, globalsFiles[0]), 'utf-8'))
+            expect(parsed.attachments).toHaveLength(1)
+            expect(parsed.attachments[0]).toMatchObject({ name: 'my file attachment', type: 'text/plain' })
+            expect(parsed.errors).toHaveLength(0)
+        })
+    })
+
+    describe('incremental flush', () => {
+        it('writes finished tests before the run is finalised and never replays a message', async () => {
+            state.pushRuntimeMessage({ type: 'allure:suite:start', data: { name: 'suite' } })
+            state.pushRuntimeMessage({ type: 'allure:test:start', data: { name: 'first test', start: Date.now() } })
+            state.pushRuntimeMessage({ type: 'allure:test:end', data: { status: 'passed' as any, stop: Date.now() } })
+            state.pushRuntimeMessage({ type: 'allure:test:start', data: { name: 'second test', start: Date.now() } })
+
+            await state.processRuntimeMessage(false)
+            // a second flush with nothing new must be a no-op
+            await state.processRuntimeMessage(false)
+
+            expect(getResults(outputDir).results.map((r: any) => r.name)).toEqual(['first test'])
+
+            state.pushRuntimeMessage({ type: 'allure:test:end', data: { status: 'failed' as any, stop: Date.now() } })
+            state.pushRuntimeMessage({ type: 'allure:suite:end', data: {} })
+
+            await state.processRuntimeMessage()
+
+            const { results } = getResults(outputDir)
+            expect(results.map((r: any) => r.name).sort()).toEqual(['first test', 'second test'])
+            expect(results.filter((r: any) => r.name === 'first test')).toHaveLength(1)
+        })
+    })
+})

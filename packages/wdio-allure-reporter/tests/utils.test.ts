@@ -1,0 +1,232 @@
+import { describe, expect, it } from 'vitest'
+import type { CommandArgs } from '@wdio/types'
+import { Status } from 'allure-js-commons'
+import CompoundError from '../src/compoundError.js'
+import path from 'node:path'
+import {
+    convertSuiteTagsToLabels,
+    findLast,
+    getErrorFromFailedTest,
+    getTestStatus,
+    isScreenshotCommand,
+    toPackageLabel,
+    normalizeCapabilityName,
+} from '../src/utils.js'
+
+describe('utils', () => {
+    describe('isScreenshotCommand', () => {
+        it('isScreenshotCommand', () => {
+            expect(isScreenshotCommand({ endpoint: '/session/id/screenshot' } as CommandArgs)).toEqual(true)
+            expect(isScreenshotCommand({ endpoint: '/wdu/hub/session/id/screenshot' } as CommandArgs)).toEqual(true)
+            expect(isScreenshotCommand({ endpoint: '/session/id/click' } as CommandArgs)).toEqual(false)
+            expect(isScreenshotCommand({ command: 'takeScreenshot' } as CommandArgs)).toEqual(true)
+            expect(isScreenshotCommand({ command: 'elementClick' } as CommandArgs)).toEqual(false)
+            expect(isScreenshotCommand({ endpoint: '/session/id/element/id/screenshot' } as CommandArgs)).toEqual(true)
+        })
+    })
+
+    describe('getTestStatus', () => {
+        it('return  status for jasmine', () => {
+            const config: any = { framework: 'jasmine' }
+            expect(getTestStatus({} as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('broken for test with no error', () => {
+            const config: any = { framework: 'mocha' }
+            expect(getTestStatus({} as any, config)).toEqual(Status.BROKEN)
+        })
+
+        it('failed for AssertionError', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { name: 'Error', message: 'AssertionError' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('failed for AssertionError stacktrace', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { stack: 'AssertionError' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('failed for AssertionError with custom message via error name', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { name: 'AssertionError', message: 'Login failed' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('failed for error name containing assert (e.g. AssertionError [ERR_ASSERTION])', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { name: 'AssertionError [ERR_ASSERTION]', message: 'Custom message' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('failed for error with only name AssertionError and no message or stack', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { name: 'AssertionError' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.FAILED)
+        })
+
+        it('broken for not AssertionError', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { name: 'MyError' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.BROKEN)
+        })
+
+        it('broken for error without stacktrace', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: {} }
+            expect(getTestStatus(test as any, config)).toEqual(Status.BROKEN)
+        })
+
+        it('failed status for not AssertionError stacktrace', () => {
+            const config: any = { framework: 'mocha' }
+            const test = { error: { stack: 'MyError stack trace' } }
+            expect(getTestStatus(test as any, config)).toEqual(Status.BROKEN)
+        })
+    })
+
+    describe('getErrorFromFailedTest', () => {
+        it('should handle test with no error object', () => {
+            const testStat = {}
+            expect(getErrorFromFailedTest(testStat as any)).toBeUndefined()
+        })
+
+        // wdio-mocha-framework returns a single 'error', while wdio-jasmine-framework returns an array of 'errors'
+        it('should return just the error property when there is no errors property', () => {
+            const testStat = {
+                error: new Error('Everything is Broken Forever'),
+            }
+            expect(getErrorFromFailedTest(testStat as any)!.message).toBe(
+                'Everything is Broken Forever'
+            )
+        })
+
+        it('should return a single error when there is an errors array with one error', () => {
+            const testStat = {
+                errors: [new Error('Everything is Broken Forever')],
+                error: new Error('Everything is Broken Forever'),
+            }
+            expect(getErrorFromFailedTest(testStat as any)!.message).toBe(
+                'Everything is Broken Forever'
+            )
+        })
+
+        it('should return a CompoundError of the errors when there is more than one error', () => {
+            const testStat = {
+                errors: [
+                    new Error('Everything is Broken Forever'),
+                    new Error('Additional things are broken'),
+                ],
+                error: new Error('Everything is Broken Forever'),
+            }
+            const error = getErrorFromFailedTest(
+                testStat as any
+            ) as CompoundError
+            expect(error instanceof CompoundError).toBe(true)
+            expect(error.innerErrors).toEqual(testStat.errors)
+        })
+    })
+
+    describe('findLast', () => {
+        const arr = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+        it('should return last matched element', () => {
+            expect(findLast(arr, (el) => el % 2 === 0)).toEqual(8)
+
+        })
+
+        it('should return undefind when nothing matched', () => {
+            expect(findLast(arr, (el) => el === 10)).toEqual(undefined)
+        })
+    })
+
+    describe('getSuiteLabels', () => {
+        describe('suite stats with tags', () => {
+            it('returns allure labels', () => {
+                expect(
+                    convertSuiteTagsToLabels([
+                        {
+                            name: '@foo=bar',
+                            line: 1
+                        }
+                    ])
+                ).toEqual([
+                    {
+                        name: 'foo',
+                        value: 'bar',
+                    },
+                ])
+            })
+        })
+
+        describe('suite stats with invalid tags', () => {
+            it('returns empty array', () => {
+                expect(
+                    convertSuiteTagsToLabels([
+                        {
+                            name: 'foo bar',
+                            line: 1
+                        },
+                        {
+                            name: 'foo,bar',
+                            line: 2
+                        }
+                    ])
+                ).toEqual([])
+            })
+        })
+
+        describe('suite stats without tags', () => {
+            it('returns empty array', () => {
+                expect(convertSuiteTagsToLabels([])).toEqual(
+                    []
+                )
+            })
+        })
+    })
+
+    describe('toPackageLabel', () => {
+        it('should not collapse a Windows absolute path into just the drive letter (#15496)', () => {
+            const file = path.join(process.cwd(), 'test', 'specs', 'mySuite.e2e.js')
+
+            const pkg = toPackageLabel(file)
+
+            expect(pkg).not.toEqual('C')
+            expect(pkg).toEqual('test.specs.mySuite.e2e.js')
+        })
+
+        it('should still strip a trailing :line:column position suffix', () => {
+            const file = `${path.join(process.cwd(), 'test', 'specs', 'mySuite.e2e.js')}:10:5`
+
+            const pkg = toPackageLabel(file)
+
+            expect(pkg).toEqual('test.specs.mySuite.e2e.js')
+        })
+
+        it('should return an empty string for an empty path', () => {
+            expect(toPackageLabel()).toEqual('')
+            expect(toPackageLabel('')).toEqual('')
+        })
+    })
+
+    describe('normalizeCapabilityName', () => {
+        it('collapses Google Chrome aliases including space-separated names', () => {
+            expect(normalizeCapabilityName('chrome')).toEqual('chrome')
+            expect(normalizeCapabilityName('googlechrome')).toEqual('chrome')
+            expect(normalizeCapabilityName('Google Chrome')).toEqual('chrome')
+            expect(normalizeCapabilityName('  Google   Chrome  ')).toEqual('chrome')
+        })
+
+        it('collapses Microsoft Edge aliases including space-separated names', () => {
+            expect(normalizeCapabilityName('edge')).toEqual('edge')
+            expect(normalizeCapabilityName('msedge')).toEqual('edge')
+            expect(normalizeCapabilityName('microsoftedge')).toEqual('edge')
+            expect(normalizeCapabilityName('Microsoft Edge')).toEqual('edge')
+        })
+
+        it('lowercases and collapses spaces for other names without aliasing them', () => {
+            expect(normalizeCapabilityName('iPhone 12')).toEqual('iphone 12')
+            expect(normalizeCapabilityName('Firefox')).toEqual('firefox')
+        })
+    })
+})

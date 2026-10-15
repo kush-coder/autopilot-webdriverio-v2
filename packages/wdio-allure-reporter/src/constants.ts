@@ -1,0 +1,27 @@
+export const events = {
+    runtimeMessage: 'allure:runtimeMessage',
+    addTestInfo: 'allure:addTestInfo',
+    startStep: 'allure:startStep',
+    endStep: 'allure:endStep',
+    addLabel: 'allure:addLabel',
+    addLink: 'allure:addLink',
+    addFeature: 'allure:addFeature',
+    addStory: 'allure:addStory',
+    addEpic: 'allure:addEpic',
+    addSuite: 'allure:addSuite',
+    addSubSuite: 'allure:addSubSuite',
+    addParentSuite: 'allure:addParentSuite',
+    addOwner: 'allure:addOwner',
+    addSeverity: 'allure:addSeverity',
+    addTag: 'allure:addTag',
+    addIssue: 'allure:addIssue',
+    addAllureId: 'allure:addAllureId',
+    addTestId: 'allure:addTestId',
+    addDescription: 'allure:addDescription',
+    addAttachment: 'allure:addAttachment',
+    addStep: 'allure:addStep',
+    addArgument: 'allure:addArgument',
+    addAllureStep: 'allure:addAllureStep',
+} as const
+
+export const DEFAULT_CID = 'default'

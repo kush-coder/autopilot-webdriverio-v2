@@ -1,0 +1,28 @@
+.docusaurus-theme-github-codeblock {
+    position: relative;
+}
+.docusaurus-theme-github-codeblock .githubLink {
+    font-family: var(--ifm-font-family-monospace);
+    position: absolute;
+    top: 7px;
+    color: var(--ifm-color-primary);
+    opacity: .5;
+    border: 1px solid rgba(27, 31, 36, 0.15);
+    border-radius: 5px;
+    padding: 5px 10px;
+    right: 0;
+    transition: none;
+    text-decoration: none;
+    box-shadow: 0 1px 0 rgb(27 31 36 / 4%), inset 0 1px 0 rgb(255 255 255 / 25%);
+}
+html[data-theme="dark"] .docusaurus-theme-github-codeblock .githubLink {
+    border: 1px solid var(--ifm-color-emphasis-300);
+    box-shadow: none;
+}
+.docusaurus-theme-github-codeblock .githubLink:hover {
+    opacity: 1;
+}
+
+.docusaurus-theme-github-codeblock .theme-code-block>div:last-child:hover {
+    z-index: 10;
+}

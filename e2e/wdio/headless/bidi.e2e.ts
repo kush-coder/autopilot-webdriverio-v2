@@ -1,0 +1,755 @@
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import url from 'node:url'
+
+import { browser, expect } from '@wdio/globals'
+import type { local, remote } from 'webdriver'
+
+const extensionFixture = path.resolve(
+    path.dirname(url.fileURLToPath(import.meta.url)),
+    '__fixtures__',
+    'web-extension'
+)
+
+describe('bidi e2e test', () => {
+    describe('execute', () => {
+        it('generates a nice stack trace', async function () {
+            /**
+             * bidi feature, so skip if:
+             *   - browser doesn't support Bidi
+             *   - browser is firefox as we see random driver exceptions
+             */
+            if (!browser.isBidi || browser.capabilities.browserName === 'firefox') {
+                return this.skip()
+            }
+
+            /**
+             * The gutter number is the call site in this file, read from the
+             * stack frame. A literal line number fails as soon as a line is
+             * inserted above this test.
+             */
+            const expectAnnotatedThrow = (stack: string, snippet: string) => {
+                const escaped = snippet.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                expect(stack).toMatch(new RegExp(`\\d+ │ ${escaped}`))
+                const line = stack.match(new RegExp(`(\\d+) │ ${escaped}`))?.[1]
+                expect(stack).toContain(`bidi.e2e.ts:${line}:`)
+            }
+
+            const result = await browser.execute(async () => {
+                const a: number = 1
+                console.log('Hello Bidi')
+                if (a) {
+                    if (a) {
+                        throw new Error('Hello Bidi')
+                    }
+                }
+            }).catch(err => err)
+            expectAnnotatedThrow(result.stack, 'if(a){if(a){throw new Error("Hello Bidi")}}}')
+
+            const result2 = await browser.execute(async () => {
+                const a: number = 1
+                console.log('Hello Bidi')
+                if (a) {
+                    if (a) {
+                        await Promise.reject(new Error('Hello Bidi'))
+                    }
+                }
+            }).catch(err => err)
+            expectAnnotatedThrow(result2.stack, 'if(a){if(a){await Promise.reject(new Error("Hello Bidi"))}}}')
+        })
+    })
+
+    it('prints a PDF with browsingContext.print', async function () {
+        if (!browser.isBidi) {
+            return this.skip()
+        }
+
+        await browser.url('https://guinea-pig.webdriver.io/')
+        const file = path.join(os.tmpdir(), `bidi-save-pdf-${browser.capabilities.browserName}-${Date.now()}.pdf`)
+        const pdf = await browser.savePDF(file, {
+            orientation: 'landscape',
+            left: 2
+        })
+
+        expect(browser.isBidi).toBe(true)
+        expect(pdf.subarray(0, 5).toString()).toBe('%PDF-')
+        expect((await fs.readFile(file)).subarray(0, 5).toString()).toBe('%PDF-')
+        await fs.rm(file, { force: true })
+    })
+
+    it('can send bidi commands', async function () {
+        /**
+         * skip in case of Safari
+         */
+        if (!browser.isBidi) {
+            return this.skip()
+        }
+
+        const result = await browser.browsingContextGetTree({})
+        const context = await browser.getWindowHandle()
+        expect(result.contexts).toHaveLength(1)
+        expect(result.contexts[0].context).toBe(context)
+    })
+
+    it('can listen to events', async function () {
+        /**
+         * skip in case of Safari
+         */
+        if (!browser.isBidi) {
+            return this.skip()
+        }
+
+        const logEvents: local.LogEntry[] = []
+        await browser.sessionSubscribe({ events: ['log.entryAdded'] })
+        browser.on('log.entryAdded', (logEntry) => logEvents.push(logEntry))
+        await browser.execute(() => console.log('Hello Bidi'))
+
+        await browser.waitUntil(
+            async () => logEvents.find((logEvent) => logEvent.text === 'Hello Bidi'),
+            {
+                timeout: 5000,
+                timeoutMsg: 'Expected bidi log entry to be added'
+            }
+        )
+    })
+
+    const executeArgs = ['string', true, 42, -0, Infinity, -Infinity, NaN, [1, 2, 3], new Map([['foo', 'bar']]), new Set([]), /foobar/]
+
+    /**
+     * passed locally but not on CI
+     */
+    it.skip('can serialize function values (sync)', async function () {
+        if (!browser.isBidi) {
+            return this.skip()
+        }
+
+        function validator (str: string, bool: boolean, number: number, negZero: number, infin: number, negInfin: number, notANumber: number, arr: number[], map: Map<string, unknown>, set: Set<unknown>, regex: RegExp) {
+            return [
+                'validate string:', typeof str === 'string', '\n',
+                'validate boolean', typeof bool === 'boolean', '\n',
+                'validate number', typeof number === 'number', '\n',
+                'valdiate negative zero', Object.is(negZero, -0), '\n',
+                'validate Infinity', infin === Infinity, '\n',
+                'validate negative Infinity', negInfin === -Infinity, '\n',
+                'validate NaN', Number.isNaN(notANumber), '\n',
+                'validate array', Array.isArray(arr), '\n',
+                'validate array items', arr.every(item => typeof item === 'number'), '\n',
+                'validate map', map instanceof Map, '\n',
+                'validate set', set instanceof Set, '\n',
+                'validate regular expression', regex instanceof RegExp, '\n'
+            ]
+        }
+        const result = await browser.execute(validator, ...executeArgs as any)
+        expect(result).toEqual([
+            'validate string:',
+            true,
+            '\n',
+            'validate boolean',
+            true,
+            '\n',
+            'validate number',
+            true,
+            '\n',
+            'valdiate negative zero',
+            false,
+            '\n',
+            'validate Infinity',
+            false,
+            '\n',
+            'validate negative Infinity',
+            false,
+            '\n',
+            'validate NaN',
+            false,
+            '\n',
+            'validate array',
+            true,
+            '\n',
+            'validate array items',
+            true,
+            '\n',
+            'validate map',
+            false,
+            '\n',
+            'validate set',
+            false,
+            '\n',
+            'validate regular expression',
+            false,
+            '\n'
+        ])
+    })
+
+    /**
+     * passed locally but not on CI
+     */
+    it.skip('can serialize function values (async)', async function () {
+        if (!browser.isBidi) {
+            return this.skip()
+        }
+
+        async function asyncValidator (str: string, bool: boolean, number: number, negZero: number, infin: number, negInfin: number, notANumber: number, arr: number[], map: Map<string, unknown>, set: Set<unknown>, regex: RegExp) {
+            return Promise.resolve([
+                'validate string:', typeof str === 'string', '\n',
+                await Promise.resolve('validate boolean async'), typeof bool === 'boolean', '\n',
+                'validate number', typeof number === 'number', '\n',
+                'valdiate negative zero', Object.is(negZero, -0), '\n',
+                'validate Infinity', infin === Infinity, '\n',
+                'validate negative Infinity', negInfin === -Infinity, '\n',
+                'validate NaN', Number.isNaN(notANumber), '\n',
+                'validate array', Array.isArray(arr), '\n',
+                'validate array items', arr.every(item => typeof item === 'number'), '\n',
+                'validate map', map instanceof Map, '\n',
+                'validate set', set instanceof Set, '\n',
+                'validate regular expression', regex instanceof RegExp, '\n'
+            ])
+        }
+        const result = await browser.execute(asyncValidator as any, ...executeArgs as any)
+        expect(result).toEqual([
+            'validate string:',
+            true,
+            '\n',
+            'validate boolean async',
+            true,
+            '\n',
+            'validate number',
+            true,
+            '\n',
+            'valdiate negative zero',
+            false,
+            '\n',
+            'validate Infinity',
+            false,
+            '\n',
+            'validate negative Infinity',
+            false,
+            '\n',
+            'validate NaN',
+            false,
+            '\n',
+            'validate array',
+            true,
+            '\n',
+            'validate array items',
+            true,
+            '\n',
+            'validate map',
+            false,
+            '\n',
+            'validate set',
+            false,
+            '\n',
+            'validate regular expression',
+            false,
+            '\n'
+        ])
+    })
+
+    it('supports execute with bidi on element scope', async () => {
+        await browser.url('https://guinea-pig.webdriver.io')
+        const result = await browser.$$('.findme')[0].execute(function (elem, a, b, c, d) {
+            return (elem as unknown as HTMLElement).innerText.length + a + b + c + d
+        }, 1, 2, 3, 4)
+        expect(result).toBe(29)
+    })
+
+    describe('execute async function', () => {
+        it('works in browser scope', async () => {
+            const result = await browser.execute(async (a, b, c, d) => {
+                await new Promise((resolve) => setTimeout(resolve, 10))
+                return a + b + c + d
+            }, 1, 2, 3, 4)
+            expect(result).toBe(10)
+        })
+
+        it('works on element scope', async () => {
+            await browser.url('https://guinea-pig.webdriver.io')
+            const result = await browser.$$('.findme')[0].execute(async (elem, a, b, c, d) => {
+                await new Promise((resolve) => setTimeout(resolve, 10))
+                // "Test CSS Attributes" = 19 + 1 + 2 + 3 + 4 = 29
+                return (elem as unknown as HTMLElement).innerText.length + a + b + c + d
+            }, 1, 2, 3, 4)
+            expect(result).toBe(29)
+        })
+    })
+
+    describe('execute', () => {
+        it('allows to pass in a string', async () => {
+            const script = 'return 2 * arguments[0]'
+            const res = await browser.execute(script, 2)
+            expect(res).toBe(4)
+        })
+    })
+
+    describe('WebDriver Bidi commands', function () {
+
+        before(async function () {
+            if (!browser.isBidi) {
+                // Mostly skipping safari not supporting Bidi for now!
+                this.skip()
+            }
+        })
+
+        describe('Storage cookies', () => {
+            it('can set and get cookies with sameSite in camelCase', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+                const cookieSetParam = {
+                    cookie: {
+                        name: 'foo10',
+                        value: { type: 'string', value: 'bar' },
+                        domain: 'guinea-pig.webdriver.io',
+                        sameSite: 'default'
+                    }
+                } satisfies remote.StorageSetCookieParameters
+
+                await browser.storageSetCookie(cookieSetParam)
+
+                const cookiesGetParam = {
+                    filter: {
+                        name: 'foo10',
+                    }
+                } satisfies remote.StorageGetCookiesParameters
+                const cookies = await browser.storageGetCookies(cookiesGetParam)
+
+                expect(cookies.cookies.length).toBe(1)
+                expect(cookies.cookies[0].name).toBe('foo10')
+                expect(cookies.cookies[0].value).toEqual({ 'type': 'string', 'value': 'bar' })
+
+                // On some platforms like linux, it returns default and not lax, bug?.
+                expect(['lax', 'default']).toContain(cookies.cookies[0].sameSite)
+            })
+
+            it('can set and get cookies with partition storageKey', async () => {
+
+                await browser.url('https://guinea-pig.webdriver.io')
+                const cookieSetParam = {
+                    cookie: {
+                        name: 'foo20',
+                        value: { type: 'string', value: 'bar' },
+                        domain: 'guinea-pig.webdriver.io',
+                        sameSite: 'default',
+                        secure: true // Required with partition key in Chrome???
+                    },
+                    partition: {
+                        type: 'storageKey',
+                        sourceOrigin: 'https://guinea-pig.webdriver.io',
+                    },
+                } satisfies remote.StorageSetCookieParameters
+
+                await browser.storageSetCookie(cookieSetParam)
+
+                const cookiesGetParam = {
+                    filter: {
+                        name: 'foo20',
+                    },
+                    // Note adding partition key filtering here does not allow to find back my cookie
+                    // partition: {
+                    //     type: 'storageKey',
+                    //     sourceOrigin: 'https://guinea-pig.webdriver.io',
+                    // }
+                } satisfies remote.StorageGetCookiesParameters
+                const cookies = await browser.storageGetCookies(cookiesGetParam)
+
+                expect(cookies.cookies.length).toBe(1)
+                expect(cookies.cookies[0].name).toBe('foo20')
+                expect(cookies.cookies[0].value).toEqual({ 'type': 'string', 'value': 'bar' })
+
+                // On some platforms like linux, it returns default and not lax, bug?.
+                expect(['lax', 'default']).toContain(cookies.cookies[0].sameSite)
+            })
+        })
+
+        describe('Browser ClientWindowState', () => {
+
+            it('can get window state', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+
+                const windowState = await browser.browserGetClientWindows({})
+
+                expect(windowState.clientWindows[0].state).toBeDefined()
+            })
+
+            // To enable one day once some browser support it!
+            it.skip('can set window state to minimized', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+
+                const clientWindow = await browser.getWindowHandle()
+
+                const params: remote.BrowserSetClientWindowStateParameters = {
+                    clientWindow,
+                    state: 'minimized'
+                }
+                await browser.browserSetClientWindowState(params)
+
+                const windowState = await browser.browserGetClientWindows({})
+                expect(windowState.clientWindows[0].state).toBe('minimized')
+            })
+
+        })
+
+        describe('Browsing Context', () => {
+
+            it('can browsingContext.reload', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+
+                const params: remote.BrowsingContextReloadParameters = {
+                    context: await browser.getWindowHandle()
+                }
+                const result = await browser.browsingContextReload(params)
+
+                expect(result).toEqual({
+                    navigation: expect.any(String),
+                    url: 'https://guinea-pig.webdriver.io/',
+                })
+            })
+        })
+
+        describe('Scripts', () => {
+
+            it('can return a ScriptEvaluationResultSuccess', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+                const context = await browser.getWindowHandle()
+
+                const params: remote.ScriptCallFunctionParameters = {
+                    functionDeclaration: 'function(){ return 42 }',
+                    awaitPromise: false,
+                    target: {
+                        context
+                    }
+                }
+                const result = await browser.scriptCallFunction(params)
+
+                const expectedSuccessResult: remote.ScriptEvaluationResultSuccess = {
+                    realm: 'expect.any(String)',
+                    type: 'success',
+                    result: {
+                        type: 'number',
+                        value: 42
+                    }
+                }
+                expect(result).toEqual({
+                    ...expectedSuccessResult,
+                    realm: expect.any(String),
+                })
+            })
+
+            it('can return a ScriptEvaluationResultException', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+                const context = await browser.getWindowHandle()
+
+                const params: remote.ScriptCallFunctionParameters = {
+                    functionDeclaration: 'function(){ throw new Error("Hello Bidi") }',
+                    awaitPromise: false,
+                    target: {
+                        context
+                    }
+                }
+                const result = await browser.scriptCallFunction(params)
+
+                const expectedExceptionResult: remote.ScriptEvaluationResultException = {
+                    exceptionDetails: {
+                        columnNumber: 20,
+                        exception: {
+                            type: 'error'
+                        },
+                        lineNumber: 6,
+                        stackTrace: {
+                            callFrames: []
+                        },
+                        text: 'Error: Hello Bidi'
+                    },
+                    realm: '-5543416938055767372.-832953021250353980',
+                    type: 'exception'
+                }
+
+                expect(result).toEqual({
+                    ...expectedExceptionResult,
+                    realm: expect.any(String),
+                    exceptionDetails: {
+                        ...expectedExceptionResult.exceptionDetails,
+                        columnNumber: expect.any(Number),
+                        lineNumber: expect.any(Number),
+                        stackTrace: {
+                            callFrames: expect.any(Array)
+                        }
+                    }
+                })
+            })
+        })
+
+        describe('Geolocation', () => {
+
+            before(async function () {
+                if (browser.isFirefox) {
+                    this.skip()
+                }
+            })
+
+            const getGeolocation = async () => {
+
+                await browser.setPermissions({ name: 'geolocation' }, 'granted')
+
+                return browser.execute(() => {
+                    // You must wrap callback-based APIs in a Promise even in an async function
+                    return new Promise((resolve, reject) => {
+                        if (!navigator.geolocation) {
+                            return reject(new Error('Geolocation not supported'))
+                        }
+                        navigator.geolocation.getCurrentPosition(
+                            (position) => resolve({
+                                latitude: position.coords.latitude,
+                                longitude: position.coords.longitude,
+                                accuracy: position.coords.accuracy
+                            }),
+                            (error) => reject(error),
+                            { timeout: 10000 }
+                        )
+                    })
+                })
+            }
+
+            it('can set geolocation override with coordinates', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+                const contextId = await browser.getWindowHandle()
+
+                const params: remote.EmulationSetGeolocationOverrideParameters = {
+                    coordinates: {
+                        latitude: 52.52,
+                        longitude: 13.405,
+                        accuracy: 1
+                    } satisfies remote.EmulationGeolocationCoordinates,
+                    // Not so optional in the end...
+                    contexts: [contextId],
+                }
+                await browser.emulationSetGeolocationOverride(params)
+
+                const geolocation = await getGeolocation()
+
+                expect(geolocation).toEqual({
+                    latitude: 52.52,
+                    longitude: 13.405,
+                    accuracy: 1
+                })
+            })
+
+            it('can set geolocation override with error', async () => {
+                await browser.url('https://guinea-pig.webdriver.io')
+                const contextId = await browser.getWindowHandle()
+
+                const params: remote.EmulationSetGeolocationOverrideParameters = {
+                    error: {
+                        type: 'positionUnavailable'
+                    } satisfies remote.EmulationGeolocationPositionError,
+                    // Not so optional in the end...
+                    contexts: [contextId],
+                }
+                await browser.emulationSetGeolocationOverride(params)
+
+                const geolocation = getGeolocation()
+
+                // TODO fix one day we should be able to assert 'positionUnavailable' somehow
+                await expect(geolocation).rejects.toThrow()
+            })
+        })
+
+        describe('emulate', () => {
+            const unsupported = (err: unknown) => {
+                const message = err instanceof Error ? err.message : String(err)
+                return /unsupported operation|unknown command/i.test(message)
+            }
+
+            /**
+             * A browser that has not implemented the command rejects it. Chrome
+             * reports `unknown command`; another browser may report
+             * `unsupported operation`. That is the `emulate` contract, so skip
+             * the page assertion. `invalid argument` still fails the test.
+             */
+            async function run (this: Mocha.Context, fn: () => Promise<void>) {
+                try {
+                    await fn()
+                } catch (err) {
+                    if (unsupported(err)) {
+                        return this.skip()
+                    }
+                    throw err
+                }
+            }
+
+            it('emulates geolocation without a reload', async function () {
+                await browser.url('https://guinea-pig.webdriver.io')
+                await run.call(this, async () => {
+                    const restore = await browser.emulate('geolocation', {
+                        latitude: 52.52,
+                        longitude: 13.405,
+                        accuracy: 1
+                    })
+                    try {
+                        await browser.setPermissions({ name: 'geolocation' }, 'granted')
+                        const geolocation = await browser.execute(() => {
+                            return new Promise((resolve, reject) => {
+                                navigator.geolocation.getCurrentPosition(
+                                    (position) => resolve({
+                                        latitude: position.coords.latitude,
+                                        longitude: position.coords.longitude,
+                                        accuracy: position.coords.accuracy
+                                    }),
+                                    (error) => reject(error),
+                                    { timeout: 10000 }
+                                )
+                            })
+                        })
+                        expect(geolocation).toEqual({
+                            latitude: 52.52,
+                            longitude: 13.405,
+                            accuracy: 1
+                        })
+                    } finally {
+                        await restore()
+                    }
+                })
+            })
+
+            it('emulates the user agent without a reload', async function () {
+                await browser.url('https://guinea-pig.webdriver.io')
+                await run.call(this, async () => {
+                    const restore = await browser.emulate('userAgent', 'WebdriverIO-Emulate-UA')
+                    try {
+                        expect(await browser.execute(() => navigator.userAgent)).toBe('WebdriverIO-Emulate-UA')
+                    } finally {
+                        await restore()
+                    }
+                })
+            })
+
+            it('emulates the color scheme for matchMedia and CSS without a reload', async function () {
+                await browser.url('https://guinea-pig.webdriver.io')
+                await run.call(this, async () => {
+                    const restore = await browser.emulate('colorScheme', 'dark')
+                    try {
+                        const observed = await browser.execute(() => {
+                            const style = document.createElement('style')
+                            style.textContent = '#wdio-scheme { color: rgb(0, 128, 0) } @media (prefers-color-scheme: dark) { #wdio-scheme { color: rgb(0, 0, 128) } }'
+                            document.head.appendChild(style)
+                            const el = document.createElement('div')
+                            el.id = 'wdio-scheme'
+                            document.body.appendChild(el)
+                            return {
+                                matches: matchMedia('(prefers-color-scheme: dark)').matches,
+                                color: getComputedStyle(el).color
+                            }
+                        })
+                        expect(observed).toEqual({ matches: true, color: 'rgb(0, 0, 128)' })
+                    } finally {
+                        await restore()
+                    }
+                })
+            })
+
+            it('takes the browsing context offline without a reload', async function () {
+                await browser.url('https://guinea-pig.webdriver.io')
+                await run.call(this, async () => {
+                    const restore = await browser.emulate('onLine', false)
+                    try {
+                        const observed = await browser.execute(async () => {
+                            let fetched = 'ok'
+                            try {
+                                await fetch(`${location.href}?r=${Math.random()}`, { cache: 'no-store' })
+                            } catch {
+                                fetched = 'rejected'
+                            }
+                            return { online: navigator.onLine, fetched }
+                        })
+                        expect(observed).toEqual({ online: false, fetched: 'rejected' })
+                    } finally {
+                        await restore()
+                    }
+                })
+            })
+
+            it('emulates the timezone without a reload', async function () {
+                await browser.url('https://guinea-pig.webdriver.io')
+                await run.call(this, async () => {
+                    const restore = await browser.emulate('timezone', 'Pacific/Honolulu')
+                    try {
+                        expect(await browser.execute(() => Intl.DateTimeFormat().resolvedOptions().timeZone)).toBe('Pacific/Honolulu')
+                    } finally {
+                        await restore()
+                    }
+                })
+            })
+        })
+
+        describe('web extension', () => {
+            it('installs and uninstalls an extension', async () => {
+                const browserName = browser.capabilities.browserName ?? 'unknown'
+                /**
+                 * Chrome, Edge, and Chromium are started with the flags that
+                 * enable webExtension.install. A missing command there is a
+                 * regression. Other BiDi browsers may report `unsupported
+                 * operation` or `unknown command`; that result is asserted.
+                 */
+                const requiresExtensionCommands = /chrome|chromium|edge/i.test(browserName)
+                let id: string
+                try {
+                    id = await browser.installExtension(extensionFixture)
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err)
+                    if (!requiresExtensionCommands && /unsupported operation|unknown command/i.test(message)) {
+                        expect(message).toMatch(/unsupported operation|unknown command/i)
+                        console.log(`webExtension.install is not implemented in ${browserName}: ${message}`)
+                        return
+                    }
+                    throw err
+                }
+
+                expect(id).toEqual(expect.any(String))
+                expect(id.length).toBeGreaterThan(0)
+                await browser.uninstallExtension(id)
+                await expect(browser.uninstallExtension(id)).rejects.toThrow()
+            })
+        })
+    })
+
+    describe('history', () => {
+        it('goes back and forward between two pages', async function () {
+            if (!browser.isBidi) {
+                return this.skip()
+            }
+
+            /**
+             * Both pages are free of iframes. Chrome keeps a child frame of a
+             * page restored from the back/forward cache after it is gone, and
+             * a later `input.setFiles` rejects with `no such frame`.
+             */
+            const firstUrl = 'https://guinea-pig.webdriver.io/'
+            const secondUrl = 'https://guinea-pig.webdriver.io/reloadCounter.html'
+            await browser.url(firstUrl)
+            await browser.url(secondUrl)
+
+            await browser.back()
+            const afterBack = await browser.getUrl()
+            expect(afterBack).not.toContain('reloadCounter.html')
+            expect(new URL(afterBack).hostname).toBe('guinea-pig.webdriver.io')
+
+            await browser.forward()
+            expect(await browser.getUrl()).toContain('reloadCounter.html')
+        })
+
+        it('rejects back when the browsing context has no history entry', async function () {
+            if (!browser.isBidi) {
+                return this.skip()
+            }
+
+            const original = await browser.getWindowHandle()
+            const { context } = await browser.browsingContextCreate({ type: 'tab' })
+            await browser.switchToWindow(context)
+            try {
+                await expect(browser.back()).rejects.toThrow(/no such history entry/)
+            } finally {
+                await browser.closeWindow()
+                await browser.switchToWindow(original)
+            }
+        })
+    })
+})

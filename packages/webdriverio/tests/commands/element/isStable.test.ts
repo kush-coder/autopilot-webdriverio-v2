@@ -1,0 +1,66 @@
+import path from 'node:path'
+import { ELEMENT_KEY } from 'webdriver'
+import { expect, describe, it, beforeAll, beforeEach, afterEach, vi } from 'vitest'
+
+import { remote } from '../../../src/index.js'
+import isElementStable from '../../../src/scripts/isElementStable.js'
+
+vi.mock('fetch')
+vi.mock('@wdio/logger', () => import(path.join(process.cwd(), '__mocks__', '@wdio/logger')))
+
+describe('isStable test', () => {
+    let browser: WebdriverIO.Browser
+    let elem: any
+
+    beforeAll(async () => {
+        browser = await remote({
+            baseUrl: 'http://foobar.com',
+            capabilities: {
+                browserName: 'foobar'
+            }
+        })
+        elem = await browser.$('#foo')
+    })
+
+    beforeEach(() => {
+        global.document = { visibilityState: 'visible' } as any
+    })
+
+    it('should allow to check if element is stable', async () => {
+        await elem.isStable()
+        expect(fetch).toHaveBeenNthCalledWith(
+            1,
+            expect.objectContaining({ pathname: '/session/foobar-123/execute/async' }),
+            expect.anything()
+        )
+        expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as any).script)
+            .toEqual(expect.stringContaining('async function isElementStable'))
+        expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as any).args)
+            .toEqual([{
+                [ELEMENT_KEY]: elem.elementId,
+            }])
+    })
+
+    it('should throw if used on an inactive tab', async () => {
+        global.document = { visibilityState: 'hidden' } as any
+        await expect(isElementStable({} as HTMLElement)).rejects.toThrowError('You are checking for animations on an inactive tab, animations do not run for inactive tabs')
+    })
+
+    it('should throw an error if in native context', async () => {
+        const browser = await remote({
+            baseUrl: 'http://foobar.com',
+            capabilities: {
+                platformName: 'Android',
+                mobileMode: true,
+                nativeAppMode: true,
+            } as any
+        })
+        const elem = await browser.$('#foo')
+
+        await expect(elem.isStable()).rejects.toThrow('The `isStable` command is only available for desktop and mobile browsers.')
+    })
+
+    afterEach(() => {
+        vi.mocked(fetch).mockClear()
+    })
+})

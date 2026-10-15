@@ -1,0 +1,50 @@
+import url from 'node:url'
+import path from 'node:path'
+
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url))
+
+export const config: WebdriverIO.Config = {
+    /**
+     * specify test files
+     */
+    specs: [
+        path.join(__dirname, 'headless', 'classic.e2e.ts'),
+        path.join(__dirname, 'headless', 'roleSelector.e2e.ts'),
+        /**
+         * in a classic session `$` doesn't look into shadow roots, so finding a
+         * `shadow$` element again must use `shadow$`
+         */
+        path.join(__dirname, 'headless', 'findElementAgain.e2e.ts'),
+        path.join(__dirname, 'headless', 'actionClick.e2e.ts'),
+        path.join(__dirname, 'headless', 'missingListItem.e2e.ts'),
+        path.join(__dirname, 'headless', 'missingListItemPaths.e2e.ts'),
+        path.join(__dirname, 'headless', 'missingListItemOverwrite.e2e.ts')
+    ],
+
+    /**
+     * capabilities
+     */
+    capabilities: [{
+        browserName: 'chrome',
+        browserVersion: 'stable',
+        'wdio:enforceWebDriverClassic': true,
+        'goog:chromeOptions': {
+            args: ['headless', 'disable-gpu']
+        }
+    }],
+    bail: 1,
+
+    /**
+     * test configurations
+     */
+    logLevel: 'info',
+    framework: 'mocha',
+    outputDir: __dirname,
+
+    reporters: ['spec'],
+
+    mochaOpts: {
+        ui: 'bdd',
+        timeout: 60000
+    }
+}

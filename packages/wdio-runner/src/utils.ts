@@ -1,0 +1,227 @@
+import { deepmerge } from 'deepmerge-ts'
+import logger from '@wdio/logger'
+import { remote, multiRemote, attach, type AttachOptions } from 'webdriverio'
+import { DEFAULTS } from 'webdriver'
+import { DEFAULT_CONFIGS } from '@wdio/config'
+import type { AsymmetricMatchers, InverseAsymmetricMatchers } from 'expect-webdriverio'
+import type { Options, Capabilities } from '@wdio/types'
+import { enableFileLogging } from '@wdio/utils'
+
+const log = logger('@wdio/runner')
+
+export interface ConfigWithSessionId extends Options.Testrunner {
+    sessionId?: string
+    capabilities: Capabilities.RequestedStandaloneCapabilities
+}
+
+/**
+ * sanitizes wdio config from capability properties
+ * @param  {Object} caps  desired session capabilities
+ * @return {Object}       sanitized caps
+ */
+export function sanitizeCaps (
+    capabilities: Capabilities.RequestedStandaloneCapabilities,
+    filterOut?: boolean
+): Omit<WebdriverIO.Capabilities, 'logLevel'> {
+    const caps = 'alwaysMatch' in capabilities ? capabilities.alwaysMatch : capabilities
+    const defaultConfigsKeys = [
+        // WDIO config keys
+        ...Object.keys(DEFAULT_CONFIGS()),
+        // WebDriver config keys
+        ...Object.keys(DEFAULTS)
+    ]
+
+    return Object.keys(caps).filter((key: keyof WebdriverIO.Capabilities) => (
+        /**
+         * filter out all wdio config keys
+         */
+        !defaultConfigsKeys.includes(key as string) === !filterOut
+    )).reduce((
+        obj: WebdriverIO.Capabilities,
+        key: keyof WebdriverIO.Capabilities
+    ) => {
+        obj[key] = caps[key] as undefined
+        return obj
+    }, {})
+}
+
+/**
+ * initialize browser instance depending whether remote or multi-remote is requested
+ * @param  {Object}  config        configuration of sessions
+ * @param  {Object}  capabilities  desired session capabilities
+ * @param  {boolean} isMultiRemote isMultiRemote
+ * @return {Promise}               resolves with browser object
+ */
+export async function initializeInstance (
+    config: ConfigWithSessionId | WebdriverIO.Config,
+    capabilities: Capabilities.RequestedStandaloneCapabilities | Capabilities.RequestedMultiRemoteCapabilities,
+    isMultiRemote?: boolean
+): Promise<WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser> {
+    /**
+     * keep the log file that @wdio/local-runner gave this worker
+     */
+    await enableFileLogging(config.outputDir, { keepLogPath: true })
+
+    /**
+     * check if config has sessionId and attach it to a running session if so
+     */
+    if ('sessionId' in config) {
+        log.debug(`attach to session with id ${config.sessionId}`)
+        config.capabilities = sanitizeCaps(capabilities as WebdriverIO.Capabilities)
+
+        /**
+         * propagate connection details defined by services or user in capabilities
+         */
+        const caps = capabilities as WebdriverIO.Capabilities
+        const connectionProps = {
+            protocol: caps.protocol || config.protocol,
+            hostname: caps.hostname || config.hostname,
+            port: caps.port || config.port,
+            path: caps.path || config.path
+        }
+        const params = { ...config, ...connectionProps, capabilities } as AttachOptions
+        return attach({ ...params, options: params })
+    }
+
+    /**
+     * start a normal standalone session
+     */
+    if (!isMultiRemote) {
+        log.debug('init remote session')
+        const sessionConfig: Capabilities.WebdriverIOConfig = {
+            ...config,
+            /**
+             * allow to overwrite connection details by user through capabilities
+             */
+            ...sanitizeCaps(capabilities as Options.Connection, true),
+            capabilities: sanitizeCaps(capabilities)
+        }
+        return remote(sessionConfig)
+    }
+
+    /**
+     * initiate multi-remote sessions
+     */
+    const options: Capabilities.RequestedMultiRemoteCapabilities = {}
+    log.debug('init multi-remote session')
+    // @ts-expect-error ToDo(Christian): can be removed?
+    delete config.capabilities
+    for (const browserName of Object.keys(capabilities)) {
+        options[browserName] = deepmerge(
+            config,
+            (capabilities as Capabilities.RequestedMultiRemoteCapabilities)[browserName]
+        )
+    }
+
+    const browser = await multiRemote(options, config)
+
+    /**
+     * only attach to global environment if `injectGlobals` is set to true
+     */
+    const browserNames = config.injectGlobals ? Object.keys(capabilities) : []
+    for (const browserName of browserNames) {
+        // Instance names are chosen by the user and become globals when injectGlobals is set.
+        (globalThis as Record<string, unknown>)[browserName] = browser.getInstance(browserName)
+    }
+
+    return browser
+}
+
+type BrowserData = {
+    sessionId: string
+    protocol: string
+    hostname: string
+    port: number
+    path: string
+    queryParams: Record<string, string>
+}
+
+/**
+ * Gets { sessionId, protocol, hostname, port, path, queryParams } of every MultiRemote instance
+ * @param {object} browser browser
+ * @param {boolean} isMultiRemote isMultiRemote
+ * @return {object}
+ */
+export function getInstancesData (
+    browser: WebdriverIO.Browser | WebdriverIO.MultiRemoteBrowser,
+    isMultiRemote: boolean
+) {
+    if (!isMultiRemote) {
+        return
+    }
+
+    const multiRemoteBrowser = browser as WebdriverIO.MultiRemoteBrowser
+    const instances: Record<string, Partial<BrowserData>> = {}
+    multiRemoteBrowser.instances.forEach((browserName: string) => {
+        const { protocol, hostname, port, path, queryParams } = multiRemoteBrowser.getInstance(browserName).options
+        const { sessionId } = multiRemoteBrowser.getInstance(browserName)
+
+        instances[browserName] = { sessionId, protocol, hostname, port, path, queryParams }
+    })
+
+    return instances
+}
+
+const SUPPORTED_ASYMMETRIC_MATCHER = {
+    Any: 'any',
+    Anything: 'anything',
+    ArrayContaining: 'arrayContaining',
+    ObjectContaining: 'objectContaining',
+    StringContaining: 'stringContaining',
+    StringMatching: 'stringMatching',
+    CloseTo: 'closeTo',
+    OneOf: 'oneOf'
+} as const
+
+type AsymmetricMatcherKey = keyof typeof SUPPORTED_ASYMMETRIC_MATCHER
+
+interface SerializedAsymmetricMatcher {
+    $$typeof: AsymmetricMatcherKey
+    sample: unknown
+    inverse?: boolean
+}
+
+function isSerializedAsymmetricMatcher(arg: unknown): arg is SerializedAsymmetricMatcher {
+    return (
+        typeof arg === 'object' &&
+        arg !== null &&
+        '$$typeof' in arg &&
+        typeof (arg as Record<string, unknown>).$$typeof === 'string' &&
+        Object.keys(SUPPORTED_ASYMMETRIC_MATCHER).includes((arg as Record<string, unknown>).$$typeof as string)
+    )
+}
+
+function isOneOfMatcher(matcherKey: string): matcherKey is 'oneOf' {
+    return matcherKey === 'oneOf'
+}
+
+/**
+ * utility function to transform assertion parameters into asymmetric matchers if necessary
+ * @param arg raw value or a stringified asymmetric matcher
+ * @returns   raw value or an actual asymmetric matcher
+ */
+export function transformExpectArgs(arg: unknown): unknown {
+    if (Array.isArray(arg)) {
+        return arg.map((item) => transformExpectArgs(item))
+    }
+
+    if (!isSerializedAsymmetricMatcher(arg)) {
+        return arg
+    }
+
+    const matcherKey = SUPPORTED_ASYMMETRIC_MATCHER[arg.$$typeof] as keyof AsymmetricMatchers
+    const inverseMatcherKey = SUPPORTED_ASYMMETRIC_MATCHER[arg.$$typeof] as keyof InverseAsymmetricMatchers
+    const matcher = (arg.inverse ? expect.not[inverseMatcherKey] : expect[matcherKey]) as ((...args: unknown[]) => unknown) | undefined
+
+    if (!matcher) {
+        throw new Error(`Matcher "${matcherKey}" is not supported by expect-webdriverio`)
+    }
+
+    const transformedSample = transformExpectArgs(arg.sample)
+
+    if (isOneOfMatcher(matcherKey)) {
+        return matcher(...(transformedSample as unknown[]))
+    }
+
+    return matcher(transformedSample)
+}

@@ -1,0 +1,817 @@
+import { expectType } from 'tsd'
+
+import allure from '@wdio/allure-reporter'
+import { remote, multiRemote, SevereServiceError, Key } from 'webdriverio'
+import type { ClickOptions, Selector, Action, PDFPrintOptions } from 'webdriverio'
+import type { DetailedContext } from '@wdio/protocols'
+
+declare global {
+    namespace WebdriverIO {
+        interface Browser {
+            browserCustomCommand: (arg: unknown) => Promise<void>
+        }
+
+        interface MultiRemoteBrowser {
+            browserCustomCommand: (arg: unknown) => Promise<void>
+        }
+
+        interface Element {
+            elementCustomCommand: (arg: unknown) => Promise<number>
+        }
+
+        interface BrowsingContext {
+            contextCustomCommand: (label: string) => Promise<string>
+        }
+    }
+}
+
+const actions: Action[] = [{
+    id: 'foobar',
+    type: 'key',
+    actions: [
+        { type: 'keyDown', value: Key.Enter },
+        { type: 'pause', duration: 2_000 },
+        { type: 'keyUp', value: Key.Enter }
+    ]
+}]
+
+async function bar() {
+    // Multi-remote
+    const mr = await multiRemote({
+        myBrowserInstance: {
+            capabilities: { browserName: 'chrome' }
+        }
+    })
+
+    const rect = await mr.getWindowRect()
+    expectType<number>(rect[0].x)
+
+    const mElem = await mr.$('foobar')
+    const location = await mElem.getLocation('x')
+    expectType<number[]>(location)
+
+    const url = await multiRemoteBrowser.getUrl()
+    expectType<string[]>(url)
+
+    multiRemote({
+        myBrowserInstance: {
+            capabilities: { browserName: 'chrome' }
+        }
+    }).then(() => {}, () => {})
+
+    // $$ on a multi-remote browser resolves to a MultiRemoteElementArray
+    const mrElems = await mr.$$('foobar')
+    expectType<true>(mrElems.isMultiRemote)
+    expectType<Selector>(mrElems.selector)
+    expectType<string>(mrElems.foundWith)
+    expectType<WebdriverIO.MultiRemoteElement>(mrElems[0])
+
+    // the async iterators keep the multi-remote element type
+    expectType<string[][]>(await mrElems.map((el) => el.instances))
+    expectType<WebdriverIO.MultiRemoteElement[]>(await mrElems.filter(async () => true))
+    await mrElems.forEach((el) => el.click())
+
+    // interact with specific instance
+    const mrSingleElem = await mr.getInstance('myBrowserInstance').$('')
+    await mrSingleElem.click()
+
+    // interact with all instances
+    const mrElem = await mr.$('')
+    await mrElem.click()
+
+    // the other single element queries also give a multi-remote element
+    expectType<WebdriverIO.MultiRemoteElement>(await mr.custom$('myStrategy', '.foo'))
+    expectType<WebdriverIO.MultiRemoteElement>(await mr.react$('MyComponent', { props: { foo: 'bar' } }))
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.custom$('myStrategy', '.foo'))
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.react$('MyComponent'))
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.shadow$('.foo'))
+    expectType<boolean[]>(await (await mrElem.shadow$('.foo')).isDisplayed())
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.nextElement())
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.previousElement())
+    expectType<WebdriverIO.MultiRemoteElement>(await mrElem.parentElement())
+    expectType<string[]>(await (await mrElem.parentElement()).getTagName())
+
+    // the other list queries also give a multi-remote list
+    expectType<WebdriverIO.MultiRemoteElementArray>(await mr.custom$$('myStrategy', '.foo'))
+    expectType<WebdriverIO.MultiRemoteElementArray>(await mr.react$$('MyComponent', { props: { foo: 'bar' } }))
+    expectType<WebdriverIO.MultiRemoteElementArray>(await mrElem.custom$$('myStrategy', '.foo'))
+    expectType<WebdriverIO.MultiRemoteElementArray>(await mrElem.react$$('MyComponent'))
+    expectType<WebdriverIO.MultiRemoteElementArray>(await mrElem.shadow$$('.foo'))
+    expectType<WebdriverIO.MultiRemoteElement>((await mrElem.shadow$$('.foo'))[0])
+    expectType<string[][]>(await (await mr.custom$$('myStrategy', '.foo')).map((el) => el.instances))
+
+    // instances array
+    expectType<string[]>(mr.instances)
+
+    // mock() names each instance instead of returning a plain array
+    const mrMock = await mr.mock('**/image.jpg')
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock)
+    expectType<true>(mrMock.isMultiRemote)
+    expectType<string[]>(mrMock.instances)
+    expectType<WebdriverIO.Mock>(mrMock.getInstance('myBrowserInstance'))
+    expectType<number>(mrMock.getInstance('myBrowserInstance').calls.length)
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.respond({ ok: true }))
+    expectType<WebdriverIO.MultiRemoteMock>(await mrMock.restore())
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.on('request', (request) => {
+        expectType<boolean>(request.isBlocked)
+        // @ts-expect-error before-request payloads are not overwrite responses
+        request.statusCode
+    }))
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.on('match', () => undefined))
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.on('continue', () => undefined))
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.on('fail', () => undefined))
+    expectType<WebdriverIO.MultiRemoteMock>(mrMock.on('overwrite', () => undefined))
+    expectType<WebdriverIO.MultiRemoteMock>(await mr.select('myBrowserInstance').mock('**/image.jpg'))
+    // @ts-expect-error calls belong to one instance, not the multi-remote mock
+    mrMock.calls
+    // @ts-expect-error request ids belong to one session
+    mrMock.getBinaryResponse('req')
+
+    const elements = await browser.$$('foo').getElements()
+    expectType<string>(elements.foundWith)
+
+    // a list before `await` has `at()` and `slice()`, like the loaded list
+    expectType<string>(await browser.$$('li').at(1).getText())
+    expectType<string>(await browser.$$('li').at(-1).getText())
+    expectType<WebdriverIO.ElementArray>(await browser.$$('li').slice(0, 2))
+    expectType<string>(await browser.$$('li').slice(1)[0].getText())
+    expectType<string>(await browser.$('ul').$$('li').at(0).getText())
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    // remote
+    const remoteBrowser = await remote({ capabilities: { browserName: 'chrome' } })
+    remote({ capabilities: { browserName: 'chrome' } }).then(
+        () => {}, () => {})
+    const rElem = await browser.$('')
+    await rElem.click()
+
+    const elemA = await remoteBrowser.$('')
+    const elemB = await remoteBrowser.$('')
+    const multipleElems = await $$([elemA, elemB]).getElements()
+    const multipleElemsChain = $$([elemA, elemB])
+    expectType<WebdriverIO.ElementArray>(multipleElems)
+    // // @ts-expect-error
+    // expectType<ChainablePromiseArray>(multipleElemsChain)
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    // addCommand
+    // element
+    browser.addCommand('getClass', async function () {
+        return this.getAttribute('class').catch()
+    }, { attachToElement: true })
+
+    // browser
+    browser.addCommand('sleep', async function (ms: number) {
+        return this.pause(ms).catch()
+    })
+
+    // overwriteCommand
+
+    // element
+    type ClickOptionsExtended = ClickOptions & { wait?: boolean }
+    browser.overwriteCommand('click', async function (clickFn, opts: Partial<ClickOptionsExtended> = {}) {
+        if (opts.wait) {
+            await this.waitForClickable().catch()
+        }
+        return clickFn.call(this, opts).catch()
+    }, { attachToElement: true })
+
+    // @ts-expect-error boolean third argument was removed in v10
+    browser.addCommand('legacyElementCommand', async function () { return this.getAttribute('class') }, true)
+
+    // browser
+    // @ts-expect-error boolean third argument was removed in v10
+    browser.overwriteCommand('pause', async function (pause: Function, ms = 1000) { return pause(ms) }, false)
+
+    browser.overwriteCommand('pause', async function (pause: Function, ms = 1000) {
+        return pause(ms).catch()
+    })
+
+    // browsing context
+    browser.addCommand('contextCustomCommand', async function (label: string) {
+        expectType<WebdriverIO.BrowsingContext>(this)
+        expectType<WebdriverIO.Browser>(this.browser)
+        return `${label}: ${await this.getTitle()}`
+    }, { attachToBrowsingContext: true })
+
+    browser.overwriteCommand('getTitle', async function (origGetTitle) {
+        expectType<WebdriverIO.BrowsingContext>(this)
+        const title: string = await origGetTitle()
+        return title.trim()
+    }, { attachToBrowsingContext: true })
+
+    const [contextWithCommand] = await browser.browsingContexts()
+    expectType<string>(await contextWithCommand.contextCustomCommand('title'))
+
+    // @ts-expect-error a command cannot attach to elements and browsing contexts at once
+    browser.addCommand('both', async function () {}, { attachToElement: true, attachToBrowsingContext: true })
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    // browser
+    await browser.pause(1)
+    await browser.newWindow('https://webdriver.io', {
+        type: 'window'
+    })
+    // @ts-expect-error windowName and windowFeatures were removed in v10
+    await browser.newWindow('https://webdriver.io', { windowName: 'some name', windowFeatures: 'some features' })
+
+    await browser.createWindow('tab')
+    await browser.createWindow('window')
+
+    const waitUntil = await browser.waitUntil(
+        () => Promise.resolve(true as const),
+        {
+            timeout: 1,
+            timeoutMsg: '',
+            interval: 1
+        }
+    )
+    expectType<true | void>(waitUntil)
+    const waitUntilElems = await browser.waitUntil(async () => {
+        const elems = await $$('elems').getElements()
+        if (elems.length < 2) {
+            return false
+        }
+        return elems
+    })
+    expectType<WebdriverIO.ElementArray>(waitUntilElems)
+
+    /**
+     * `browser.url()` always returns a context; every member is checked in browsingContext.ts
+     */
+    const page = await browser.url('https://webdriver.io')
+    expectType<WebdriverIO.BrowsingContext>(page)
+    expectType<WebdriverIO.BrowsingContext>(await page.frame('iframe'))
+    const pages = await browser.browsingContexts()
+    expectType<WebdriverIO.BrowsingContext[]>(pages)
+
+    await browser.getCookies()
+    await browser.getCookies({ name: 'foobar' })
+    // @ts-expect-error string filters were removed in v10
+    await browser.getCookies('foobar')
+    // @ts-expect-error string filters were removed in v10
+    await browser.getCookies(['foobar'])
+
+    const htmlElement = await browser.$('h1')
+    expectType<WebdriverIO.Element>(htmlElement)
+    expectType<number>(await browser.$$('li')[0].execute((elem, a: number) => elem.innerText.length + a, 1))
+    expectType<WebdriverIO.Element>(await (await browser.$('main')).$('h1'))
+    await htmlElement.getHTML({ includeSelectorTag: false })
+    // @ts-expect-error boolean argument was removed in v10
+    await htmlElement.getHTML(false)
+
+    await browser.startActivity({
+        appPackage: 'com.example.app',
+        appActivity: '.MainActivity'
+    })
+    // @ts-expect-error positional arguments were removed in v10
+    await browser.startActivity('com.example.app', '.MainActivity')
+    await browser.startActivity({
+        appPackage: 'com.example.app',
+        appActivity: '.MainActivity',
+        // @ts-expect-error appWaitPackage was removed in v10
+        appWaitPackage: 'com.example.app',
+    })
+    await browser.startActivity({
+        appPackage: 'com.example.app',
+        appActivity: '.MainActivity',
+        // @ts-expect-error appWaitActivity was removed in v10
+        appWaitActivity: '.MainActivity',
+    })
+    await browser.startActivity({
+        appPackage: 'com.example.app',
+        appActivity: '.MainActivity',
+        // @ts-expect-error optionalIntentArguments was removed in v10
+        optionalIntentArguments: '--ez extra true',
+    })
+    await browser.setCookies({
+        name: '',
+        value: ''
+    })
+    await browser.setCookies([{
+        name: '',
+        value: '',
+        domain: '',
+        path: '',
+        expiry: 1,
+        sameSite: 'lax',
+        secure: true,
+        httpOnly: true
+    }])
+    await browser.deleteCookies('foobar')
+    await browser.deleteCookies(['foobar'])
+
+    const executeResult = await browser.execute(function (x: number) {
+        return x
+    }, 4)
+    expectType<number>(executeResult)
+
+    expectType<number>(
+        await browser.execute(async (arg: number) => {
+            arg.toFixed()
+            return 123
+        }, 456)
+    )
+
+    expectType<string>(
+        (await browser.getContext()) as string
+    )
+    expectType<{ id: string }>(
+        await browser.getContext() as DetailedContext
+    )
+    expectType<string[]>(
+        (await browser.getContexts()) as string[]
+    )
+    expectType<{ id: string }[]>(
+        (await browser.getContexts()) as DetailedContext[]
+    )
+
+    expectType<void>(
+        await browser.execute(async () => {
+            await Promise.resolve()
+        })
+    )
+
+    const callResult = <number> await browser.call(() =>
+        new Promise(resolve => setTimeout(() => resolve(4), 1))
+    )
+    expectType<number>(callResult)
+
+    // printPage
+    const pdfOptions: PDFPrintOptions = {
+        orientation: 'landscape',
+        background: true,
+        width: 24.5,
+        height: 26.9,
+        top: 10,
+        bottom: 10,
+        left: 5,
+        right: 5,
+        shrinkToFit: true,
+        pageRanges: ['1', 2]
+    }
+    await browser.savePDF('./packages/bar.pdf', pdfOptions)
+
+    const orientation: string = 'portrait'
+    const stringOrientation: PDFPrintOptions = { orientation }
+    await browser.savePDF('./packages/bar.pdf', stringOrientation)
+
+    await browser.savePDF('./packages/bar.pdf')
+
+    // browser element command
+    browser.getElementRect('elementId')
+
+    // protocol command return mapped object value
+    const { x, y, width, height } = await browser.getWindowRect()
+    expectType<number>(x)
+    expectType<number>(y)
+    expectType<number>(width)
+    expectType<number>(height)
+
+    // getProperty return type
+    expectType<unknown>($('#foo').getProperty('bar'))
+
+    // protocol command return unmapped object
+    const { foo, bar } = await browser.takeHeapSnapshot()
+    expectType<any>(foo)
+
+    // browser command return mapped object value
+    const { width: w, height: h }  =  await browser.getWindowSize()
+    expectType<number>(w)
+    expectType<number>(h)
+
+    // browser custom command
+    await browser.browserCustomCommand(14)
+    const ambientResult = await browser.ambientCommand(123)
+    expectType<number>(ambientResult)
+
+    // $
+    const el1 = await $('').getElement()
+    const strFunction = (str: string) => str
+    strFunction(el1.selector as string)
+    strFunction(el1.elementId)
+    const el2 = await el1.$('')
+    const el3 = await el2.$('')
+    await el1.getCSSProperty('style')
+    await el2.click()
+    // @ts-expect-error don't allow browser commands on WebdriverIO.Element
+    await el1.url('https://webdriver.io')
+    await el1.moveTo({ xOffset: 0, yOffset: 0 })
+    const elementExists: true | void = await el2.waitForExist({
+        timeout: 1,
+        timeoutMsg: '',
+        interval: 1,
+        reverse: true
+    })
+    expectType<true | void>(elementExists)
+    const elementDisplayed: true | void = await el2.waitForDisplayed({
+        timeout: 1,
+        timeoutMsg: '',
+        interval: 1,
+        reverse: true
+    })
+    expectType<true | void>(elementDisplayed)
+    const elementEnabled: true | void = await el2.waitForEnabled({
+        timeout: 1,
+        timeoutMsg: '',
+        interval: 1,
+        reverse: true
+    })
+    expectType<true | void>(elementEnabled)
+    const elementClickable: true | void = await el2.waitForClickable({
+        timeout: 1,
+        timeoutMsg: '',
+        interval: 1,
+        reverse: true
+    })
+    expectType<true | void>(elementClickable)
+
+    expectType<number>(await el1.getLocation('x')) // as number
+    expectType<number>((await el1.getLocation()).y) // as Location
+
+    expectType<number>(await el1.getSize('y')) // as number
+    expectType<number>(await el1.getSize('width')) // as number
+    expectType<number>((await el1.getSize()).height) // as Size
+
+    // element custom command
+    const el2result = await el3.elementCustomCommand(4)
+    expectType<number>(el2result)
+
+    // chainable promise element custom command
+    const elcResult = await $('foo').$('bar').elementCustomCommand(4)
+    expectType<number>(elcResult)
+
+    // $$
+    const elems = await $$('').getElements()
+    const el4 = elems[0]
+    const el5 = await el4.$('')
+    expectType<string>(await el4.getAttribute('class'))
+    expectType<void|unknown>(await el5.scrollIntoView(false))
+
+    // async iterator
+    const iteratorResult = await $$('').map((el) => el.getText())
+    expectType<string[]>(iteratorResult)
+    expectType<string[]>(await elems.map((el) => el.getText()))
+    expectType<WebdriverIO.Element[]>(await elems.filter(async () => true))
+    expectType<WebdriverIO.Element>(await elems.find(async () => true))
+
+    // An examples of addValue command with enabled/disabled translation to Unicode
+    const elem = await $('')
+    await elem.addValue('Delete')
+
+    // scroll into view
+    await elem.scrollIntoView(true)
+    const scrollOptions: ScrollIntoViewOptions = {
+        block: 'center',
+        // @ts-expect-error
+        foo: 'bar'
+    }
+    await elem.scrollIntoView(scrollOptions)
+
+    // An examples of setValue command with enabled/disabled translation to Unicode
+    const elem1 = await $('')
+    elem1.setValue('Delete')
+    await elem1.setFiles('/tmp/file.png')
+    await elem1.setFiles(['/tmp/a.png', '/tmp/b.png'])
+    // @ts-expect-error setFiles takes a path or a list of paths
+    await elem1.setFiles(123)
+    // @ts-expect-error uploadFile was removed in v10
+    await browser.uploadFile('/tmp/file.png')
+
+    const selector$$: string | HTMLElement | Function | Record<'element-6066-11e4-a52e-4f735466cecf', string> | {strategy: Function; strategyName: string; strategyArguments: any[]} = elems.selector
+    ;(elems.parent as WebdriverIO.Element).click()
+    ;(elems.parent as WebdriverIO.Browser).url('')
+    ;(elems.parent as WebdriverIO.MultiRemoteBrowser).url('')
+    // @ts-expect-error
+    ;(elems.parent as WebdriverIO.Browser).click()
+
+    // test access to base client properties
+    expectType<string>(browser.sessionId)
+    expectType<string>((browser.capabilities as WebdriverIO.Capabilities).browserName)
+    expectType<string>((browser.requestedCapabilities as WebdriverIO.Capabilities).browserName)
+    expectType<boolean>(browser.isMobile)
+    expectType<boolean>(browser.isAndroid)
+    expectType<boolean>(browser.isIOS)
+    expectType<boolean>(browser.isMobile)
+
+    // shadow$ shadow$$
+    const el6 = await $('')
+    const shadowElem = await el6.shadow$('')
+    await shadowElem.click()
+    const shadowElems = await el6.shadow$$('')
+    await shadowElems[0].click()
+
+    // react$ react$$
+    const reactWrapper = await browser.react$('')
+    const reactWrapperWithOptions = await browser.react$('', {
+        props: {},
+        state: { someValue: true }
+    })
+    const reactElement = await reactWrapper.react$('')
+    const reactElementWithOptions = await reactWrapper.react$('', {
+        props: {},
+        state: { someValue: true }
+    })
+    await reactElement.click()
+    const reactElements = await reactWrapper.react$$('')
+    const reactElementsWithOptions = await reactWrapper.react$$('', {
+        props: {},
+        state: { someValue: true }
+    })
+    await reactElements[0].click()
+
+    // dragAndDrop
+    const ele = await $('')
+    await ele.dragAndDrop(ele, { duration: 0 })
+    await ele.dragAndDrop({ x: 1, y: 2 })
+
+    // addLocatorStrategy
+    browser.addLocatorStrategy('myStrat', () => document.body)
+    browser.addLocatorStrategy('myStrat', () => document.querySelectorAll('div'))
+    browser.addLocatorStrategy('myStrat', (selector, root) => {
+        expectType<String>(selector)
+        expectType<HTMLElement>(root)
+        const scope = root ? root : document
+        return scope.querySelectorAll(selector)
+    })
+
+    // network mocking
+    browser.throttleNetwork('Regular2G')
+    browser.throttleNetwork({
+        offline: false,
+        downloadThroughput: 50 * 1024 / 8,
+        uploadThroughput: 20 * 1024 / 8,
+        latency: 500
+    })
+    browser.mock('**/image.jpg')
+    browser.mock(new URLPattern({ pathname: '/image.jpg' }))
+    const mock = await browser.mock('**/image.jpg', {
+        method: 'get',
+        requestHeaders: { foo: 'bar' }
+    })
+    mock.abort(true)
+    mock.abortOnce()
+    mock.clear()
+    mock.respond('/other/resource.jpg')
+    mock.respond('/other/resource.jpg', {
+        statusCode: 100,
+        headers: { foo: 'bar' },
+        fetchResponse: false
+    })
+    mock.respond(Buffer.from('foobar'))
+    mock.respond(new Uint8Array([137, 80, 78, 71]))
+    mock.respond(new Uint16Array([0x0102]))
+    mock.respond(new DataView(new ArrayBuffer(6), 1, 4))
+    mock.respond(new Uint8Array([137, 80, 78, 71]).buffer)
+    mock.respond({ foo: 'bar' })
+    mock.respond((request) => ({ url: request.request.url, foo: 'bar' }))
+    mock.respond((request) => `id=${request.request.request}`)
+    mock.respond(() => Buffer.from('foobar'))
+    mock.respond(() => new Uint8Array([137, 80, 78, 71]))
+    mock.respond(() => new Float32Array([1]))
+    mock.respondOnce(new Int8Array([-1]))
+    mock.respondOnce(() => new DataView(new ArrayBuffer(6), 1, 4))
+    mock.respondOnce(() => new Uint8Array([137, 80, 78, 71]).buffer)
+    expectType<Uint8Array | null>(mock.getBinaryResponse('request-id'))
+    mock.respondOnce('/other/resource.jpg')
+    mock.respondOnce('/other/resource.jpg', {
+        statusCode: 100,
+        headers: { foo: 'bar' },
+        fetchResponse: false
+    })
+    mock.restore()
+    const match = mock.calls[0]
+    match.isBlocked
+    match.response.content
+
+    // async chain API
+    expectType<WebdriverIO.Element>(
+        await browser.$('foo').$('bar').$$('loo')[2].$('foo').$('bar').getElement())
+    expectType<Selector>(
+        await browser.$('foo').$('bar').selector)
+    expectType<Error>(
+        await browser.$('foo').$('bar').error)
+    expectType<string>(
+        await browser.$('foo').$('bar').elementId)
+    expectType<WebdriverIO.Browser | WebdriverIO.Element | WebdriverIO.MultiRemoteBrowser | WebdriverIO.BrowsingContext>(
+        await browser.$('foo').$('bar').parent)
+    expectType<number>(
+        await browser.$('foo').$('bar').$$('loo').length)
+    expectType<Selector>(
+        await browser.$('foo').$('bar').$$('loo').selector)
+    expectType<WebdriverIO.Browser | WebdriverIO.Element | WebdriverIO.MultiRemoteBrowser | WebdriverIO.BrowsingContext>(
+        await browser.$('foo').$('bar').$$('loo').parent)
+    expectType<Selector>(browser.$$('.item').selector)
+    expectType<string>(browser.$$('.item').foundWith)
+    expectType<WebdriverIO.Browser | WebdriverIO.Element | WebdriverIO.MultiRemoteBrowser | WebdriverIO.BrowsingContext>(
+        browser.$$('.item').parent)
+    // @ts-expect-error selector is available immediately and is not a promise
+    browser.$$('.item').selector.then(() => undefined)
+
+    // promise chain API
+    expectType<string>(
+        await browser.$('foo').getElement().then(_ => _.getText()))
+
+    expectType<void>(
+        await browser.$$('foo').forEach(() => true)
+    )
+    expectType<void>(
+        await browser.$$('foo').forEach(async (el) => {
+            expectType<WebdriverIO.Element>(el)
+            await el.getText()
+        })
+    )
+    expectType<void>(
+        await browser.$$('foo').forEachSeries(async (el) => {
+            await el.getText()
+        })
+    )
+    expectType<string[]>(
+        await browser.$('foo').$$('bar').map((el) => {
+            expectType<WebdriverIO.Element>(el)
+            return browser.call(async () => true).then(() => el.getText())
+        })
+    )
+    expectType<WebdriverIO.Element>(
+        await browser.$$('foo').find(() => true)
+    )
+    expectType<WebdriverIO.Element>(
+        await browser.$$('foo').find(async () => true)
+    )
+    expectType<number>(
+        await browser.$$('foo').findIndex(() => true)
+    )
+    expectType<boolean>(
+        await browser.$$('foo').some(async () => true)
+    )
+    expectType<boolean>(
+        await browser.$$('foo').every(async () => true)
+    )
+    expectType<WebdriverIO.Element[]>(
+        await browser.$$('foo').filter(async () => true)
+    )
+
+    for await (const el of browser.$$('foo')) {
+        expectType<WebdriverIO.Element>(el)
+    }
+    const panels = await browser.$$('foo')
+    for (const panel of panels) {
+        await expect(panel).toHaveAttribute('class', 'false')
+    }
+
+    type Random = {
+        foo: WebdriverIO.Element
+        bar: WebdriverIO.Browser
+    }
+    expectType<Random>(
+        await browser.$$('foo').reduce((acc, curr) => {
+            acc = {
+                foo: curr,
+                bar: browser
+            }
+            return browser.call(async () => {}).then(() => acc)
+        }, {} as Random)
+    )
+
+    const elemArrayTest: WebdriverIO.ElementArray = {} as any
+    expectType<string>(elemArrayTest.foundWith)
+    expectType<WebdriverIO.Element>(elemArrayTest[123])
+
+    // event listeners support both sync and async functions
+    browser.on('dialog', (dialog) => dialog.dismiss())
+    browser.on('dialog', async (dialog) => {
+        await dialog.dismiss()
+    })
+    browser.once('dialog', async (dialog) => {
+        await dialog.dismiss()
+    })
+
+    // getElement type check
+    const singleChainedElement = await browser.$('foo').getElement()
+    const singleElement = await singleChainedElement.getElement()
+    expectType<string>(singleElement.elementId)
+    expectType<string>(singleElement.elementId)
+    // @ts-expect-error
+    const singleElementError = $('selector').getElements()
+    // @ts-expect-error
+    const singleElementError2 = singleChainedElement.getElements()
+
+    // getElements type check
+    const multiChainedElements = await browser.$$('foo').getElements()
+    const multiElements = await multiChainedElements.getElements()
+    expectType<number>(multiChainedElements.length)
+    expectType<number>(multiElements.length)
+    // @ts-expect-error
+    const multiElementError = $$('selector').getElement()
+    // @ts-expect-error
+    const multiElementError2 = multiElements.getElement()
+
+    // test entries() functionality
+    for await (const [index, element] of await browser.$$('foo').entries()) {
+        expectType<number>(index)
+        expectType<WebdriverIO.Element>(element)
+    }
+
+    // test with elements array
+    const elemArray = await browser.$$('foo').getElements()
+    for await (const [index, element] of elemArray.entries()) {
+        expectType<number>(index)
+        expectType<WebdriverIO.Element>(element)
+    }
+
+    // test return type of entries()
+    const entriesIterator = browser.$$('foo').entries()
+    expectType<AsyncIterableIterator<[number, WebdriverIO.Element]>>(entriesIterator)
+
+    // Emulate tests
+    let restore = await browser.emulate('geolocation', { latitude: 1, longitude: 2 })
+    await restore()
+    restore = await browser.emulate('geolocation', { error: 'positionUnavailable' })
+    restore = await browser.emulate('userAgent', 'foobar')
+    restore = await browser.emulate('colorScheme', 'dark')
+    restore = await browser.emulate('media', { prefersReducedMotion: 'reduce', hover: 'none' })
+    restore = await browser.emulate('onLine', true)
+    restore = await browser.emulate('locale', 'fr-FR')
+    restore = await browser.emulate('timezone', 'Pacific/Honolulu')
+    restore = await browser.emulate('touch', 1)
+    restore = await browser.emulate('orientation', { natural: 'portrait', type: 'portrait-primary' })
+    restore = await browser.emulate('screen', { width: 800, height: 600 })
+    restore = await browser.emulate('viewportMeta', true)
+    restore = await browser.emulate('textLayout', 'mobile')
+    restore = await browser.emulate('scripting', false)
+    restore = await browser.emulate('scrollbar', 'overlay')
+    restore = await browser.emulate('forcedColors', 'dark')
+    restore = await browser.emulate('device', 'iPhone 8')
+    // @ts-expect-error invalid param
+    restore = await browser.emulate('onLine', 'dark')
+    // @ts-expect-error viewport meta cannot be false
+    restore = await browser.emulate('viewportMeta', false)
+    // @ts-expect-error scripting cannot be forced on
+    restore = await browser.emulate('scripting', true)
+    // @ts-expect-error invalid scope
+    restore = await browser.emulate('foobar')
+    const clock = await browser.emulate('clock', { now: new Date(2021, 3, 14) })
+    await clock.restore()
+
+    browser.addInitScript(() => {
+        // nothing
+    })
+
+    browser.addInitScript((emit) => {
+        emit('hello')
+    })
+
+    browser.addInitScript((param, emit) => {
+        emit('hello' + param.toFixed())
+    }, 123)
+
+    browser.addInitScript((param, param2, emit) => {
+        emit('hello' + param.toFixed() + param2.charAt(1))
+    }, 123, 'hello')
+
+    browser.addInitScript((param, param2, param3, emit) => {
+        emit('hello' + param.toFixed() + param2.charAt(1) + param3.charAt(1))
+    }, 123, 'hello', 'true')
+}
+
+async function strictSelectors() {
+    const browser = await remote({ capabilities: {} })
+
+    // strict mode can be toggled per call, on the browser and on an element
+    expectType<string>(await browser.$('button', { strict: false }).getTagName())
+    expectType<string>(await browser.$('button', { strict: true }).getTagName())
+    expectType<string>(await browser.$('div').$('button', { strict: false }).getTagName())
+
+    const extensionId = await browser.installExtension('./dist')
+    expectType<string>(extensionId)
+    await browser.installExtension('./ext.zip')
+    await browser.installExtension({ base64: 'UEsDBA==' })
+    await browser.uninstallExtension(extensionId)
+    // @ts-expect-error extension payload must be a path or { base64 }
+    await browser.installExtension({ path: './dist' })
+    // @ts-expect-error extension id is a string
+    await browser.uninstallExtension(42)
+
+    // @ts-expect-error unknown option
+    await browser.$('button', { strictly: false })
+    // @ts-expect-error strict needs to be a boolean
+    await browser.$('button', { strict: 'nope' })
+}
+
+function testSevereServiceError_noParameters() {
+    throw new SevereServiceError()
+}
+
+function testSevereServiceError_stringParameter() {
+    throw new SevereServiceError('Something happened.')
+}
+
+// allure-reporter
+allure.addFeature('')
+// @ts-expect-error
+allure.addDescription('with wrong param:', 123)
+
+export default {}

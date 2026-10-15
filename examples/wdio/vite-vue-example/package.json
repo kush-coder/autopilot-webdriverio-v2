@@ -1,0 +1,27 @@
+{
+  "name": "vite-vue-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "wdio": "wdio run ./wdio.conf.ts"
+  },
+  "dependencies": {
+    "vue": "^3.4.15"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/vue": "^8.0.1",
+    "@types/mocha": "^10.0.10",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "@wdio/types": "workspace:*",
+    "expect-webdriverio": "^8.0.0",
+    "mocha": "^12.0.2",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.6",
+    "vue-tsc": "^3.3.12"
+  }
+}

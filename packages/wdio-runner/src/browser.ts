@@ -1,0 +1,583 @@
+import url from 'node:url'
+import path from 'node:path'
+
+import logger from '@wdio/logger'
+import { browser } from '@wdio/globals'
+import { executeHooksWithArgs, getWdioKind } from '@wdio/utils'
+import { wdioCustomMatchers } from 'expect-webdriverio'
+import { some } from 'expect-webdriverio/api'
+import { ELEMENT_KEY } from 'webdriver'
+import {
+    MESSAGE_TYPES,
+    browserChannelMessage,
+    parseBrowserToRunnerMessage,
+    workerProcessEvent,
+    type AnyRunnerToBrowserMessage,
+    type BrowserTestEvent,
+    type CoverageMapPayload,
+    type Services,
+    type Workers,
+} from '@wdio/types'
+
+import { transformExpectArgs } from './utils.js'
+import type BaseReporter from './reporter.js'
+import type { TestFramework, WorkerResponseMessage } from './types.js'
+
+const log = logger('@wdio/runner')
+const sep = '\n  - '
+const ERROR_CHECK_INTERVAL = 500
+const DEFAULT_TIMEOUT = 60 * 1000
+
+type WDIOErrorEvent = Partial<Pick<ErrorEvent, 'filename' | 'message' | 'error'>> & { hasViteError?: boolean }
+
+interface TestState {
+    failures: number
+    events: BrowserTestEvent[]
+    errors?: WDIOErrorEvent[]
+    hasViteError?: boolean
+}
+
+interface LogMessage {
+    level: string
+    message: string
+    source: string
+    timestamp: number
+}
+
+declare global {
+    interface Window {
+        __wdioErrors__: WDIOErrorEvent[]
+        __wdioEvents__: BrowserTestEvent[]
+        __wdioFailures__: number
+        __wdioTestsStartedAt__?: number
+        __coverage__?: unknown
+    }
+}
+
+export default class BrowserFramework implements Omit<TestFramework, 'init'> {
+    #retryOutdatedOptimizeDep = false
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    #runnerOptions: any // `any` here because we don't want to create a dependency to @wdio/browser-runner
+    #resolveTestStatePromise?: (value: TestState) => void
+
+    constructor (
+        private _cid: string,
+        private _config: WebdriverIO.Config & { sessionId?: string },
+        private _specs: string[],
+        private _reporter: BaseReporter
+    ) {
+        // listen on testrunner events
+        process.on('message', this.#processMessage.bind(this))
+
+        const [, runnerOptions] = Array.isArray(_config.runner) ? _config.runner : []
+        this.#runnerOptions = runnerOptions || {}
+    }
+
+    /**
+     * always return true as it is irrelevant for component testing
+     */
+    hasTests () {
+        return true
+    }
+
+    init () {
+        return undefined as unknown as TestFramework
+    }
+
+    async run () {
+        try {
+            const failures = await this.#loop()
+            return failures
+        } catch (_err: unknown) {
+            const err = _err as Error
+            if ((err as Error).message.includes('net::ERR_CONNECTION_REFUSE')) {
+                err.message = `Failed to load test page to run tests, make sure your browser can access "${browser.options.baseUrl}"`
+            }
+
+            log.error(`Failed to run browser tests with cid ${this._cid}: ${err.stack}`)
+            process.send!({
+                origin: 'worker',
+                name: 'error',
+                content: { name: err.name, message: err.message, stack: err.stack }
+            })
+            return 1
+        }
+    }
+
+    async #loop () {
+        let failures = 0
+
+        /**
+         * start tests in a single browser session, hence we use a for...of instead of using Promise concurrency
+         */
+        for (const spec of this._specs) {
+            failures += await this.#runSpec(spec)
+        }
+
+        return failures
+    }
+
+    async #runSpec (spec: string, retried = false): Promise<number> {
+        this.#retryOutdatedOptimizeDep = false
+        const timeout = this._config.mochaOpts?.timeout || DEFAULT_TIMEOUT
+        log.info(`Run spec file ${spec} for cid ${this._cid}`)
+
+        /**
+         * create promise to resolve test state which is being sent through the socket
+         * connection from the browser through the main process to the worker
+         */
+        const testStatePromise = new Promise<TestState>((resolve) => {
+            this.#resolveTestStatePromise = resolve
+        })
+
+        /**
+         * if a `sessionId` is part of `this._config` it means we are in watch mode and are
+         * re-using a previous session. Since Vite has already a hot-reload feature, there
+         * is no need to call the url command again
+         */
+        if (!this._config.sessionId) {
+            await browser.url(`/?cid=${this._cid}&spec=${(new URL(spec)).pathname}`)
+        }
+        // await browser.debug()
+
+        /**
+         * set spec and cid as cookie so the Vite plugin can detect session even without
+         * query parameters
+         */
+        await browser.setCookies([
+            { name: 'WDIO_SPEC', value: url.fileURLToPath(spec) },
+            { name: 'WDIO_CID', value: this._cid }
+        ])
+
+        /**
+         * wait for test results or page errors
+         */
+        const testTimeout = setTimeout(
+            () => this.#onTestTimeout(`Timed out after ${timeout / 1000}s waiting for test results`),
+            timeout)
+
+        /**
+         * run checks for errors here to avoid breakage in communication with the browser
+         */
+        const errorInterval = setInterval(
+            this.#checkForTestError.bind(this),
+            ERROR_CHECK_INTERVAL)
+
+        const state: TestState = await testStatePromise
+        clearTimeout(testTimeout)
+        clearInterval(errorInterval)
+
+        /**
+         * capture coverage if enabled
+         */
+        if (this.#runnerOptions.coverage?.enabled && process.send) {
+            const coverageMap = await browser.execute(
+                () => (window.__coverage__ || {}))
+            const coverage = (
+                coverageMap && typeof coverageMap === 'object' && !Array.isArray(coverageMap)
+                    ? coverageMap
+                    : {}
+            ) as CoverageMapPayload
+            const workerEvent: Workers.WorkerEvent = {
+                origin: 'worker',
+                name: 'workerEvent',
+                args: workerProcessEvent(MESSAGE_TYPES.coverageMap, coverage)
+            }
+            process.send(workerEvent)
+        }
+
+        /**
+         * let runner fail if we detect an error
+         */
+        if (state.errors?.length) {
+            const errors = state.errors.map((ev) => state.hasViteError
+                ? `${ev.message}\n${(ev.error ? ev.error.split('\n').slice(1).join('\n') : '')}`
+                : `${path.basename(ev.filename || spec)}: ${ev.message}\n${(ev.error ? ev.error.split('\n').slice(1).join('\n') : '')}`)
+
+            /**
+             * retry Vite dynamic import errors once
+             */
+            if (!retried && errors.some((err) => (
+                err.includes('Failed to fetch dynamically imported module') ||
+                err.includes('the server responded with a status of 504 (Outdated Optimize Dep)') ||
+                /**
+                 * this is specific to Preact and can bre resolved by rerunning the spec
+                 */
+                err.includes('undefined is not an object (evaluating \'r.__H\')')
+            ))) {
+                log.info('Retry test run due to dynamic import error')
+                return this.#runSpec(spec, true)
+            }
+
+            const { name, message, stack } = new Error(state.hasViteError
+                ? `Test failed due to the following error: ${errors.join('\n\n')}`
+                : `Test failed due to following error(s):${sep}${errors.join(sep)}`)
+            process.send!({
+                origin: 'worker',
+                name: 'error',
+                content: { name, message, stack }
+            })
+            return 1
+        }
+
+        /**
+         * report browser events to WebdriverIO reporter
+         */
+        for (const ev of (state.events || [])) {
+            if ((ev.type === 'suite:start' || ev.type === 'suite:end') && ev.title === '') {
+                continue
+            }
+            /**
+             * Mocha events include an error object. Reporter.emit types `error`
+             * as a string, so the formatted event is passed through as-is.
+             */
+            this._reporter.emit(ev.type, {
+                ...ev,
+                file: spec,
+                uid: `${this._cid}-${Buffer.from(ev.fullTitle || ev.title || '').toString('base64')}`,
+                cid: this._cid
+            } as Parameters<BaseReporter['emit']>[1])
+        }
+        return state.failures || 0
+    }
+
+    async #processMessage (cmd: Workers.WorkerCommand) {
+        if (cmd.command !== 'workerRequest' || !process.send) {
+            return
+        }
+
+        const id = cmd.args?.id
+        const message = parseBrowserToRunnerMessage(cmd.args?.message)
+        if (typeof id !== 'number' || !message) {
+            return log.error(`Ignoring invalid browser channel message for cid ${this._cid}`)
+        }
+
+        switch (message.type) {
+        case MESSAGE_TYPES.hookTriggerMessage:
+            return this.#handleHook(id, message.value)
+        case MESSAGE_TYPES.consoleMessage:
+            return this.#handleConsole(message.value)
+        case MESSAGE_TYPES.commandRequestMessage:
+            return this.#handleCommand(id, message.value)
+        case MESSAGE_TYPES.expectRequestMessage:
+            return this.#handleExpectation(id, message.value)
+        case MESSAGE_TYPES.browserTestResult:
+            return this.#handleTestFinish(message.value)
+        case MESSAGE_TYPES.expectMatchersRequest:
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.expectMatchersResponse, {
+                matchers: Object.keys(wdioCustomMatchers)
+            }))
+        case MESSAGE_TYPES.initiateBrowserStateRequest:
+            return
+        default:
+            return assertBrowserChannelHandled(message)
+        }
+    }
+
+    async #handleHook (id: number, payload: Workers.HookTriggerEvent) {
+        const error: Error | undefined = await executeHooksWithArgs(
+            payload.name,
+            this._config[payload.name as keyof Services.HookFunctions],
+            payload.args
+        ).then(() => undefined, (err) => err)
+
+        if (error) {
+            log.warn(`Failed running "${payload.name}" hook for cid ${payload.cid}: ${error.message}`)
+        }
+
+        return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.hookResultMessage, {
+            id: payload.id,
+            error
+        }))
+    }
+
+    #sendWorkerResponse (id: number, message: AnyRunnerToBrowserMessage) {
+        if (!process.send) {
+            return
+        }
+
+        const response: WorkerResponseMessage = {
+            origin: 'worker',
+            name: 'workerResponse',
+            args: { id, message }
+        }
+        process.send(response)
+    }
+
+    /**
+     * Print console message executed in browser to the terminal
+     * @param message console.log message args
+     * @returns void
+     */
+    #handleConsole (message: Workers.ConsoleEvent) {
+        const isWDIOLog = Boolean(typeof message.args[0] === 'string' && message.args[0].startsWith('[WDIO]') && message.type !== 'error')
+        if (message.name !== 'consoleEvent' || isWDIOLog) {
+            return
+        }
+        console[message.type](...(message.args || []))
+    }
+
+    async #handleCommand (id: number, payload: Workers.CommandRequestEvent) {
+        log.debug(`Received browser message: ${JSON.stringify(payload)}`)
+        const cid = payload.cid
+        if (typeof cid !== 'string') {
+            const { message, stack, name } = new Error(`No "cid" property passed into command message with id "${payload.id}"`)
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.commandResponseMessage, {
+                id: payload.id,
+                error: { message, stack, name }
+            }))
+        }
+
+        try {
+            /**
+             * user either the browser instance or an element based on whether or not
+             * a scope property was passed in
+             */
+            const scope = payload.scope
+                ? await browser.$({ [ELEMENT_KEY]: payload.scope })
+                : browser
+
+            /**
+             * double check if function is registered
+             */
+            if (typeof scope[payload.commandName as keyof typeof scope] !== 'function') {
+                throw new Error(`${payload.scope ? 'element' : 'browser'}.${payload.commandName} is not a function`)
+            }
+
+            let result = await (scope[payload.commandName as keyof typeof scope] as Function)(...payload.args)
+
+            /**
+             * the result is awaited, so its `wdio.kind` brand (see `@wdio/utils` `kind.ts`)
+             * is the kind of a loaded object
+             */
+            const kind = getWdioKind(result)
+
+            /**
+             * if result is an element, transform it into an element reference
+             */
+            if (kind === 'element') {
+                result = result.elementId
+                    ? { [ELEMENT_KEY]: result.elementId }
+                    : result.error
+                        ? { message: result.error.message, stack: result.error.stack, name: result.error.name }
+                        : undefined
+            /**
+             * if result is an array of elements, transform it into an array of element references
+             */
+            } else if (kind === 'element-array') {
+                /**
+                 * need await here since ElementArray functions return a promise
+                 */
+                result = (await result.map((res: WebdriverIO.Element) => ({
+                    [ELEMENT_KEY]: res.elementId
+                }))).filter(Boolean)
+            }
+
+            /**
+             * a mock or a browsing context is sent as JSON, which drops its brand, so send its kind
+             */
+            const response: Workers.CommandResponseEvent = { id: payload.id, result }
+            if (kind === 'mock' || kind === 'browsing-context') {
+                response.kind = kind
+            }
+            const resultMsg = browserChannelMessage(MESSAGE_TYPES.commandResponseMessage, response)
+            log.debug(`Return command result: ${resultMsg}`)
+            return this.#sendWorkerResponse(id, resultMsg)
+        } catch (error: unknown) {
+            const { message, stack, name } = error as Error
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.commandResponseMessage, {
+                id: payload.id,
+                error: { message, stack, name }
+            }))
+        }
+    }
+
+    /**
+     * handle expectation assertions within the worker process
+     * @param id message id from communicator
+     * @param payload information about the expectation to run
+     * @returns void
+     */
+    async #handleExpectation (id: number, payload: Workers.ExpectRequestEvent) {
+        log.debug(`Received expectation message: ${JSON.stringify(payload)}`)
+        const cid = payload.cid
+        /**
+         * check if payload contains `cid` needed to get a browser instance from the pool
+         */
+        if (typeof cid !== 'string') {
+            const message = `No "cid" property passed into expect request message with id "${payload.id}"`
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.expectResponseMessage, { id: payload.id, pass: false, message }))
+        }
+
+        /**
+         * find matcher, e.g. `toBeDisplayed` or `toHaveTitle`
+         */
+        const matcher = wdioCustomMatchers[payload.matcherName]
+        if (!matcher) {
+            const message = `Couldn't find matcher with name "${payload.matcherName}"`
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.expectResponseMessage, { id: payload.id, pass: false, message }))
+        }
+
+        try {
+            const isSome = payload.scope.isSome
+            let received = payload.element
+
+            const refetchElement = async (element: WebdriverIO.Element) => {
+                /**
+                 * When having `elementId`, element was already found and it is transformed into an `WebdriverIO.Element`,
+                 * If not we need to find it first with the selector.
+                 */
+                return element.elementId
+                    ? await browser.$(element)
+                    : await browser.$(element.selector)
+            }
+
+            /**
+             * refetch the elements to get fresh references. The page sends the kind of
+             * the element, because JSON drops the properties of an element list.
+             */
+            if (!received) {
+                received = payload.context || browser
+            } else if (payload.elementKind === 'element-array') {
+                received = await browser.$$(received)
+            } else if (payload.elementKind === 'element') {
+                received = await refetchElement(received)
+            } else if (Array.isArray(received)) {
+                // a copy of an element list (WebdriverIO.Element[])
+                received = await Promise.all(received.map(refetchElement))
+            } else {
+                throw new Error(`Received value is not an element or array of elements: ${JSON.stringify(received)}`)
+            }
+
+            if (isSome) {
+                received = some(received as WebdriverIO.Element[] | WebdriverIO.ElementArray | ChainablePromiseArray)
+            }
+
+            const result = await matcher.apply(payload.scope, [received, ...payload.args.map(transformExpectArgs)])
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.expectResponseMessage, {
+                id: payload.id,
+                pass: result.pass,
+                message: result.message()
+            }))
+        } catch (err) {
+            const errorMessage = err instanceof Error ? (err as Error).stack : err
+            const message = `Failed to execute expect command "${payload.matcherName}": ${errorMessage}`
+            return this.#sendWorkerResponse(id, browserChannelMessage(MESSAGE_TYPES.expectResponseMessage, { id: payload.id, pass: false, message }))
+        }
+    }
+
+    #handleTestFinish (payload: Workers.BrowserTestResults) {
+        this.#resolveTestStatePromise!({ failures: payload.failures, events: payload.events })
+    }
+
+    #onTestTimeout (message: string) {
+        return this.#resolveTestStatePromise?.({
+            events: [],
+            failures: 1,
+            errors: [{ message }]
+        })
+    }
+
+    async #checkForTestError () {
+        const testError = await browser.execute(function fetchExecutionState () {
+            let viteError
+            const viteErrorElem = document.querySelector('vite-error-overlay')
+            if (viteErrorElem && viteErrorElem.shadowRoot) {
+                const errorElements = Array.from(viteErrorElem.shadowRoot.querySelectorAll('pre'))
+                if (errorElements.length) {
+                    viteError = [{ message: errorElements.map((elem) => elem.innerText).join('\n') }]
+                }
+            }
+            const loadError = (
+                typeof window.__wdioErrors__ === 'undefined' &&
+                document.title !== 'WebdriverIO Browser Test' &&
+                !document.querySelector('mocha-framework')
+            )
+                ?  [{ message: `Failed to load test page (title = "${document.title}", source: ${document.documentElement.innerHTML})` }]
+                : null
+            const errors = viteError || window.__wdioErrors__ || loadError
+            return { errors, hasViteError: Boolean(viteError), testsStartedAt: window.__wdioTestsStartedAt__ }
+        }).catch((err) => {
+            /**
+             * ignore error, see https://github.com/GoogleChromeLabs/chromium-bidi/issues/1102
+             */
+            if (err.message.includes('Cannot find context with specified id')) {
+                return
+            }
+
+            throw err
+        })
+
+        if (!testError) {
+            return
+        }
+
+        const { testsStartedAt: startedAtBeforeLogs, ...executionState } = testError
+        if ((executionState.errors && executionState.errors.length > 0) || executionState.hasViteError) {
+            this.#resolveTestStatePromise?.({
+                events: [],
+                failures: 1,
+                ...executionState
+            })
+        }
+
+        /**
+         * check for outdated optimize dep errors that occasionally happen in Vite
+         */
+        const logs = typeof browser.getLogs === 'function'
+            ? (await browser.getLogs('browser').catch(() => []))
+            : []
+        const severeLogs = logs.filter((log: LogMessage) => log.level === 'SEVERE' && log.source !== 'deprecation') as LogMessage[]
+        if (!this.#retryOutdatedOptimizeDep && severeLogs.some((log) => log.message?.includes('(Outdated Optimize Dep)'))) {
+            log.info('Retry test run due to outdated optimize dep')
+            this.#retryOutdatedOptimizeDep = true
+            return browser.refresh()
+        }
+
+        /**
+         * Once Mocha runs the tests, an error in the browser log belongs to a test
+         * (a caught failed request, a `console.error`, an invalid attribute): Mocha
+         * reports the test result, so it must not end the spec. Only errors logged
+         * before the tests started (setup) end it.
+         *
+         * Mocha can start between the execution state read above and `getLogs`,
+         * so without a start time, read it again after the logs.
+         */
+        const testsStartedAt = typeof startedAtBeforeLogs !== 'number' && severeLogs.length
+            ? await browser.execute(() => window.__wdioTestsStartedAt__).catch(() => undefined)
+            : startedAtBeforeLogs
+        const setupLogs = typeof testsStartedAt === 'number'
+            ? severeLogs.filter((log) => log.timestamp < testsStartedAt)
+            : severeLogs
+        if (setupLogs.length) {
+            this.#resolveTestStatePromise?.({
+                events: [],
+                failures: 1,
+                hasViteError: false,
+                /**
+                 * error messages often look like:
+                 * "http://localhost:40167/node_modules/.vite/deps/expect.js?v=bca8e2f3 - Failed to load resource: the server responded with a status of 504 (Outdated Optimize Dep)"
+                 */
+                errors: setupLogs.map((log) => {
+                    const [filename, message] = log.message!.split(' - ')
+                    return {
+                        filename: filename.startsWith('http') ? filename : undefined,
+                        message
+                    }
+                })
+            })
+        }
+    }
+
+    static init (cid: string, config: WebdriverIO.Config, specs: string[], _: unknown, reporter: BaseReporter) {
+        const framework = new BrowserFramework(cid, config, specs, reporter)
+        return framework
+    }
+}
+
+function assertBrowserChannelHandled (message: never): never {
+    const type = message && typeof message === 'object'
+        ? String((message as { type?: unknown }).type)
+        : 'unknown'
+    throw new Error(`Unhandled browser channel message (${type})`)
+}
